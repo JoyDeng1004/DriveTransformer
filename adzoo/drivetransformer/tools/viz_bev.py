@@ -26,11 +26,15 @@ def plot_bev(d, out_path='/gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetrans
     
     # histories/futures
     if 'ego_his_trajs' in d:
-        print('ego_his_trajs raw =', d['ego_his_trajs'][:5])
-        his = d['ego_his_trajs'].reshape(-1, 2)
-        ax.plot(his[:,0], his[:,1], 'o-', color='darkred',
-                markersize=3, label='his', alpha=0.6)
+        his = np.asarray(d['ego_his_trajs']).reshape(-1, 2)   # differential offsets
+        # reconstruct historical points in CURRENT lidar frame
+        # offsets satisfy: d[j] = p[j+1] - p[j], with p[-1] = current = (0,0)
+        rev_cum = np.cumsum(his[::-1], axis=0)[::-1]
+        his_pts = np.vstack([-rev_cum, np.zeros((1, 2))])
+        ax.plot(his_pts[:, 0], his_pts[:, 1], 'o-', color='darkred',
+                markersize=3, label='his', alpha=0.8)
     if 'ego_fut_trajs_fix_time' in d:
+        # ego_fut_trajs_fix_time是当前lidar系下的未来绝对点序列
         print('ego_fut_trajs_fix_time raw =', d['ego_fut_trajs_fix_time'][:5])
         fut = d['ego_fut_trajs_fix_time'].reshape(-1, 2)
         ax.plot(fut[:,0], fut[:,1], 'o-', color='green',
@@ -38,10 +42,8 @@ def plot_bev(d, out_path='/gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetrans
     if 'ego_fut_trajs_fix_dist' in d:
         print('ego_fut_trajs_fix_dist raw =', d['ego_fut_trajs_fix_dist'][:5])
         fd = d['ego_fut_trajs_fix_dist']
-        # fix_dist 输出可能是 angle-only (use_angle_as_dis_traj=True)，
-        # 这种情况下 shape 是 (N, 1)，画不出 BEV——先 print 提示
-        print(f"  [V1] fix_dist shape={fd.shape}, "
-              f"注意 config 里 use_angle_as_dis_traj=True")
+        # fix_dist 输出是 angle-only (use_angle_as_dis_traj=True)，
+        print(f"[V1] fix_dist shape={fd.shape}")
     
     # point cloud range 边框
     for x, y, w, h in [(-15, -30, 30, 60)]:
@@ -50,7 +52,7 @@ def plot_bev(d, out_path='/gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetrans
     
     ax.set_xlim(-20, 20); ax.set_ylim(-35, 35)
     ax.set_aspect('equal'); ax.grid(True, alpha=0.3)
-    ax.set_xlabel('lidar x (右)'); ax.set_ylabel('lidar y (前)')
+    ax.set_xlabel('lidar x (right)'); ax.set_ylabel('lidar y (front)')
     ax.legend()
     plt.savefig(out_path, dpi=120, bbox_inches='tight')
     print(f"[saved] {out_path}")

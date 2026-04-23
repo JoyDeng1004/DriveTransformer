@@ -45,6 +45,20 @@ def dump_sample(sample, tag):
         if isinstance(v, np.ndarray):
             print(f"  {k:30s} shape={str(v.shape):20s} "
                   f"min={v.min():+.3f} max={v.max():+.3f} mean={v.mean():+.3f}")
+    
+    # --- camera image paths (for viz_scene cross-check) ---
+    meta_keys = list(last.keys())
+    # Bench2Drive里叫 'filename'
+    fname_key = next((k for k in ('filename', 'img_filename') if k in last), None)
+    if fname_key is None:
+        print(f"  [warn] no filename-like key in img_metas. keys = {meta_keys}")
+    else:
+        paths = list(last[fname_key])
+        d['img_filenames'] = paths
+        print(f"  img_filenames ({fname_key}, n={len(paths)})")
+        for p in paths:
+            print(f"    {p}")
+
     return d
 
 def sanity_checks(d):
