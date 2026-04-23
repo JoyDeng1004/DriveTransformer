@@ -905,7 +905,10 @@ class DriveTransformerlHead(BaseModule):
                 memory_ego_motion.append(tmp_t)
             memory_ego_motion.append(self.memory_velo)
             memory_ego_motion = torch.cat(memory_ego_motion, dim=-1).float()
+            # memory_ego_motion.shape - [10, 500, 15]
             memory_ego_motion = pos2posemb(memory_ego_motion, 12)
+            # agent_temp_pos.shape - [10, 500, 768]
+            # memory_ego_motion.shape - [10, 500, 180]
             agent_temp_pos = self.ego_pose_pe(agent_temp_pos, memory_ego_motion)
             agent_temp_memory = self.ego_pose_memory(agent_temp_memory, memory_ego_motion)
         

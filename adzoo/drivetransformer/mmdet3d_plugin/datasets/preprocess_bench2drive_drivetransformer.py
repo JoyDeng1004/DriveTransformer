@@ -17,10 +17,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # camera coordinate system, and lidar coordinate system) to the right-handed coordinate system
 # consistent with the nuscenes dataset.
 
-DATAROOT = '../../../../data/bench2drive'
-MAP_ROOT = '../../../../data/bench2drive/maps'
-OUT_DIR = '../../../../data/infos'
-SPLIT_PATH = '../../../../data/split/bench2drive_base_train_val_split.json'
+DATAROOT = '/gs/bs/tga-RLA/qdeng/DriveTransformer/data/bench2drive'
+MAP_ROOT = '/gs/bs/tga-RLA/qdeng/DriveTransformer/data/bench2drive/maps'
+OUT_DIR = '/gs/bs/tga-RLA/qdeng/DriveTransformer/data/infos'
+SPLIT_PATH = '/gs/bs/tga-RLA/qdeng/DriveTransformer/data/split/bench2drive_base_train_val_split.json'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle

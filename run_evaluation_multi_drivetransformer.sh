@@ -1,13 +1,14 @@
 BASE_PORT=30000
 BASE_TM_PORT=50000
 IS_BENCH2DRIVE=True
-BASE_ROUTES=leaderboard/data/bench2drive220
-TEAM_AGENT=team_code/drivetransformer_b2d_agent.py
+# BASE_ROUTES=leaderboard/data/bench2drive220
+BASE_ROUTES=leaderboard/data/drivetransformer_bench2drive_dev10
+TEAM_AGENT=team_code/tail -f carla_pull.log.py
 TEAM_CONFIG=DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large.py+DriveTransformer/ckpts/drivetransformer_large.pth
-BASE_CHECKPOINT_ENDPOINT=eval_bench2drive220
+BASE_CHECKPOINT_ENDPOINT=eval_bench2drive_dev10
 PLANNER_TYPE=only_traj
 ALGO=DriveTransformer
-SAVE_PATH=./eval_bench2drive220_${ALGO}_${PLANNER_TYPE}
+SAVE_PATH=./eval_bench2drive_dev10_${ALGO}_${PLANNER_TYPE}
 
 
 if [ ! -d "${ALGO}_b2d_${PLANNER_TYPE}" ]; then
@@ -21,7 +22,7 @@ fi
 if [ ! -f "${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_split_done.flag" ]; then
     echo -e "****************************\033[33m Attention \033[0m ****************************"
     echo -e "\033[33m Running split_xml.py \033[0m"
-    TASK_NUM=8
+    TASK_NUM=4
     python tools/split_xml.py $BASE_ROUTES $TASK_NUM $ALGO $PLANNER_TYPE
     touch "${BASE_ROUTES}_${ALGO}_${PLANNER_TYPE}_split_done.flag"
     echo -e "\033[32m Splitting complete. Flag file created. \033[0m"
@@ -30,8 +31,8 @@ else
 fi
 
 echo -e "**************\033[36m Please Manually adjust GPU or TASK_ID \033[0m **************"
-GPU_RANK_LIST=(0 1 2 3 4 5 6 7)
-TASK_LIST=(0 1 2 3 4 5 6 7)
+GPU_RANK_LIST=(0 1 2 3)
+TASK_LIST=(0 1 2 3)
 echo -e "\033[32m GPU_RANK_LIST: $GPU_RANK_LIST \033[0m"
 echo -e "\033[32m TASK_LIST: $TASK_LIST \033[0m"
 echo -e "***********************************************************************************"
