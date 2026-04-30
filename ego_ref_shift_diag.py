@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import inspect
+import types
 
 # ============================================================
 # §0  Constants & Experiment Config
@@ -55,8 +57,42 @@ CAM_FRONT_IDX = 0
 
 
 # ============================================================
-# §1  Model Loading
+# Model Loading
 # ============================================================
+
+def patch_single_arg_ffns_for_identity(model):
+    """
+    Compatibility patch for DriveTransformer layers.
+    """
+    patched = 0
+    for module_name, module in model.named_modules():
+        if not hasattr(module, "ffns"):
+            continue
+
+        ffns = getattr(module, "ffns")
+        for i, ffn in enumerate(ffns):
+            sig = inspect.signature(ffn.forward)
+            num_params = len(sig.parameters)
+
+            # Bound method:
+            #   forward(x)                 -> 1 param
+            #   forward(x, identity=None)  -> 2 params
+            if num_params >= 2:
+                continue
+
+            old_forward = ffn.forward
+
+            def new_forward(self, x, identity=None, _old_forward=old_forward):
+                out = _old_forward(x)
+                if identity is not None:
+                    out = out + identity
+                return out
+
+            ffn.forward = types.MethodType(new_forward, ffn)
+            patched += 1
+            print(f"[patch] wrapped single-arg FFN: {module_name}.ffns[{i}]")
+
+    print(f"[patch] total wrapped FFNs = {patched}")
 
 def load_model(config_path: str, ckpt_path: str, device: str = "cuda:0"):
     """
@@ -82,74 +118,235 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda:0"):
     load_checkpoint(model, ckpt_path, map_location="cpu", strict=False)
 
     model = model.to(device).eval()
-    # Disable any test-time augmentation if present
+    # Compatibility patch for FFN forward(x) vs forward(x, identity)
+    patch_single_arg_ffns_for_identity(model)
     return model
 
 
 # ============================================================
-# §2  Data Loading
+# Data Loading
 # ============================================================
 
 def load_sample(config_path: str, sample_idx: int, device: str = "cuda:0"):
     """
     Load a single sample from B2D val set, ready to feed into model.
-
-    Returns:
-        batch:   dict for model(return_loss=False, **batch)
-                 keys: img [1,N_cam,3,H,W], img_metas [[meta]]
-        gt_info: dict for plotting
-                 keys: lidar2img [N_cam,4,4], img_for_plot [H,W,3] uint8,
-                       front_boxes_xywl_yaw list[(cx,cy,l,w,yaw)]
     """
     from mmcv import Config
     from mmcv.datasets import build_dataset
     from mmcv.parallel import collate
+    from mmcv.parallel import DataContainer
+    def unwrap_dc(x):
+        """
+        Recursively unwrap mmcv DataContainer.
+        Keep list/dict structure.
+        """
+        while isinstance(x, DataContainer):
+            x = x.data
+        if isinstance(x, dict):
+            return {k: unwrap_dc(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [unwrap_dc(v) for v in x]
+        if isinstance(x, tuple):
+            return tuple(unwrap_dc(v) for v in x)
+        return x
+
+    def move_to_device(x, device):
+        if torch.is_tensor(x):
+            x = x.to(device)
+            if torch.is_floating_point(x):
+                x = x.float()
+            return x
+        if isinstance(x, dict):
+            return {k: move_to_device(v, device) for k, v in x.items()}
+        if isinstance(x, list):
+            return [move_to_device(v, device) for v in x]
+        if isinstance(x, tuple):
+            return tuple(move_to_device(v, device) for v in x)
+        return x
 
     cfg = Config.fromfile(config_path)
 
-    # 1. Build val/test dataset
-    # TODO[VERIFY]: which key holds val pipeline — `data.val` or `data.test`?
+    # Build val/test dataset
     data_cfg = cfg.data.val          # or cfg.data.test
     data_cfg.test_mode = True
     dataset = build_dataset(data_cfg)
 
-    sample = dataset[sample_idx]     # dict from pipeline (already has DataContainers)
+    sample = dataset[sample_idx]
+    print("[debug] raw sample keys =", sorted(sample.keys()))
 
-    # 2. Collate single sample → batch (DataContainer-aware)
     batch = collate([sample], samples_per_gpu=1)
+    print("[debug] collated batch keys =", sorted(batch.keys()))
 
-    # img is wrapped in DataContainer — unwrap and move
-    img = batch["img"].data[0].to(device) if hasattr(batch["img"], "data") \
-          else batch["img"].to(device)
-    img_metas = batch["img_metas"].data[0] if hasattr(batch["img_metas"], "data") \
-                else batch["img_metas"]
+    model_batch = {}
+    for k, v in batch.items():
+        v = unwrap_dc(v)
 
-    model_batch = {"img": [img], "img_metas": [img_metas]}
-    # NOTE: forward_test expects img and img_metas wrapped in *outer list*
-    # (one entry per augmentation). With test_mode=True and no TTA, single entry.
+        if k == "img" and isinstance(v, list) and len(v) == 1:
+            v = v[0]
 
-    # 4. Build gt_info for plotting from img_metas[0]
-    meta0 = img_metas[0]
-    lidar2img = np.stack([np.asarray(m) for m in meta0["lidar2img"]], axis=0)
-    # ^ shape [N_cam, 4, 4]
+        model_batch[k] = v
 
-    # 5. Front camera image for the right panel
-    # img tensor is normalized — need to denormalize for plotting.
-    # mean/std typically in cfg.img_norm_cfg
-    # TODO[VERIFY]
+    # ---- normalize img ----
+    img_tensor = model_batch["img"]
+    if isinstance(img_tensor, list) and len(img_tensor) == 1:
+        img_tensor = img_tensor[0]
+
+    if not torch.is_tensor(img_tensor):
+        img_tensor = torch.as_tensor(img_tensor)
+
+    img_tensor = img_tensor.to(device)
+
+    # Expected by DriveTransformer forward_test:
+    #   img: Tensor [B, N_cam, 3, H, W]
+    if img_tensor.dim() == 4:
+        img_tensor = img_tensor.unsqueeze(0)
+    elif img_tensor.dim() != 5:
+        raise RuntimeError(f"unexpected img_tensor.shape = {tuple(img_tensor.shape)}")
+
+    model_batch["img"] = img_tensor
+    print(f"[debug] img_tensor.shape = {tuple(img_tensor.shape)}")
+
+    # ---- normalize img_metas ----
+    img_metas = model_batch["img_metas"]
+
+    # Possible structures after collate / unwrap:
+    #   [[meta0]] -> [meta0]
+    #   [meta0]   -> [meta0]
+    #   meta0     -> [meta0]   # because the generic len==1 unwrap may strip one level
+    if isinstance(img_metas, list) and len(img_metas) == 1 and isinstance(img_metas[0], list):
+        img_metas = img_metas[0]
+
+    if isinstance(img_metas, dict):
+        img_metas = [img_metas]
+
+    assert isinstance(img_metas, list) and len(img_metas) > 0 and isinstance(img_metas[0], dict), (
+        f"unexpected img_metas structure: {type(img_metas)}, "
+        f"first={type(img_metas[0]) if isinstance(img_metas, list) and len(img_metas) > 0 else 'N/A'}"
+    )
+
+    model_batch["img_metas"] = img_metas
+    metas_inner = img_metas
+    meta0 = metas_inner[0]
+    print(f"[debug] meta0 keys = {list(meta0.keys())}")
+
+    # ---- ensure common geometry keys are tensor[B, N_cam, ...] ----
+    for key in [
+        "lidar2img",
+        "cam_intrinsic",
+        "lidar2cam",
+        "cam2lidar",
+        "ego2global",
+        "lidar2ego",
+        "ego2lidar",
+    ]:
+        if key not in model_batch:
+            continue
+
+        x = model_batch[key]
+
+        # unwrap single-element list
+        if isinstance(x, list) and len(x) == 1:
+            x = x[0]
+
+        # list of camera matrices -> ndarray [N_cam, ...]
+        if isinstance(x, list):
+            x = np.stack([np.asarray(xx) for xx in x], axis=0)
+
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+
+        if torch.is_tensor(x):
+            x = x.float().to(device)
+            # camera-wise matrix: [N_cam, 4, 4] or [N_cam, 3, 3] -> [B, N_cam, ...]
+            if x.dim() in (3, 4) and x.shape[0] == 6:
+                x = x.unsqueeze(0)
+
+        model_batch[key] = x
+
+    # ---- fallback: recover cam_intrinsic if pipeline did not expose it ----
+    if "cam_intrinsic" not in model_batch:
+        cam_intrinsic = None
+
+        # 1) try img_metas
+        if "cam_intrinsic" in meta0:
+            cam_intrinsic = meta0["cam_intrinsic"]
+
+        # 2) try dataset info
+        if cam_intrinsic is None:
+            try:
+                info = dataset.data_infos[sample_idx] \
+                    if hasattr(dataset, "data_infos") \
+                    else dataset.get_data_info(sample_idx)
+
+                if "cam_intrinsic" in info:
+                    cam_intrinsic = info["cam_intrinsic"]
+
+                elif "cams" in info:
+                    cams = info["cams"]
+                    cam_names = [
+                        "CAM_FRONT",
+                        "CAM_FRONT_LEFT",
+                        "CAM_FRONT_RIGHT",
+                        "CAM_BACK",
+                        "CAM_BACK_LEFT",
+                        "CAM_BACK_RIGHT",
+                    ]
+
+                    mats = []
+                    for cam in cam_names:
+                        if cam in cams and "cam_intrinsic" in cams[cam]:
+                            mats.append(np.asarray(cams[cam]["cam_intrinsic"]))
+
+                    if len(mats) == 6:
+                        cam_intrinsic = np.stack(mats, axis=0)
+
+            except Exception as e:
+                print(f"[warn] failed to recover cam_intrinsic from dataset info: {e}")
+
+        if cam_intrinsic is not None:
+            if isinstance(cam_intrinsic, list):
+                cam_intrinsic = np.stack([np.asarray(x) for x in cam_intrinsic], axis=0)
+
+            cam_intrinsic = torch.as_tensor(
+                cam_intrinsic,
+                dtype=torch.float32,
+                device=device,
+            )
+
+            # [6, 3, 3] -> [1, 6, 3, 3]
+            if cam_intrinsic.dim() == 3 and cam_intrinsic.shape[0] == 6:
+                cam_intrinsic = cam_intrinsic.unsqueeze(0)
+
+            model_batch["cam_intrinsic"] = cam_intrinsic
+            print("[debug] recovered cam_intrinsic.shape =", tuple(cam_intrinsic.shape))
+        else:
+            print("[warn] cam_intrinsic still missing after fallback")
+
+    # ---- move remaining tensor fields to device ----
+    model_batch = move_to_device(model_batch, device)
+
+    for key in ["lidar2img", "cam_intrinsic", "lidar2cam", "cam2lidar"]:
+        if key in model_batch:
+            x = model_batch[key]
+            if torch.is_tensor(x):
+                print(f"[debug] model_batch['{key}'].shape = {tuple(x.shape)}, dtype={x.dtype}, device={x.device}")
+            else:
+                print(f"[debug] model_batch['{key}'] type = {type(x)}")
+        else:
+            print(f"[warn] model_batch missing key: {key}")
+
+    # Front camera image for the right panel
     img_norm = cfg.get("img_norm_cfg", {"mean": [123.675, 116.28, 103.53],
                                          "std":  [58.395, 57.12, 57.375],
                                          "to_rgb": True})
-    img_np = img[0, CAM_FRONT_IDX].detach().cpu().numpy()  # [3, H, W]
+    img_np = img_tensor[0, CAM_FRONT_IDX].detach().cpu().numpy()  # [3, H, W]
     img_np = img_np.transpose(1, 2, 0)
     img_np = img_np * np.array(img_norm["std"]) + np.array(img_norm["mean"])
     if not img_norm.get("to_rgb", True):
         img_np = img_np[..., ::-1]
     img_np = np.clip(img_np, 0, 255).astype(np.uint8)
 
-    # 6. Extract front-vehicle GT boxes for BEV reference
-    # TODO[VERIFY]: gt_bboxes_3d access path.
-    # ----- FILL IN -----
+    # Extract front-vehicle GT boxes for BEV reference
     front_boxes = []
     try:
         info = dataset.data_infos[sample_idx] \
@@ -171,26 +368,33 @@ def load_sample(config_path: str, sample_idx: int, device: str = "cuda:0"):
     except Exception as e:
         print(f"[warn] failed to extract GT boxes for plotting: {e}")
     # ------------------
-
+    lidar2img_for_plot = model_batch["lidar2img"]
+    if torch.is_tensor(lidar2img_for_plot):
+        lidar2img_for_plot = lidar2img_for_plot.detach().cpu().numpy()
+    if lidar2img_for_plot.ndim == 4 and lidar2img_for_plot.shape[0] == 1:
+        lidar2img_for_plot = lidar2img_for_plot[0]
     gt_info = {
-        "lidar2img": lidar2img,
+        "lidar2img": lidar2img_for_plot,
         "img_for_plot": img_np,
         "front_boxes_xywl_yaw": front_boxes,
     }
+
+    for key in ["map_gt_bboxes_3d", "ego_his_trajs", "ego_fut_cmd", "ego_lcf_feat"]:
+        if key in model_batch:
+            v = model_batch[key]
+            print(f"[debug] before forward {key}: type={type(v)}")
+            if isinstance(v, list):
+                print(f"[debug] before forward {key}: len={len(v)}, elem_type={type(v[0])}")
     return model_batch, gt_info
 
-
 # ============================================================
-# §3  Hook Factory
+# Hook Factory
 # ============================================================
 
 def make_ego_ref_perturb_hook(shift_xyz: tuple):
     """
     Closure factory: returns a forward_pre_hook that replaces ego_ref
     (positional arg #EGO_REF_ARG_IDX) with ego_ref + shift.
-
-    Args:
-        shift_xyz: (dx, dy, dz) in meters, ego frame  (+y=front, +x=right)
     """
     dx, dy, dz = shift_xyz
 
@@ -228,7 +432,7 @@ def make_ego_ref_perturb_hook(shift_xyz: tuple):
 
 
 # ============================================================
-# §4  Experiment Loop
+# Experiment Loop
 # ============================================================
 
 @torch.no_grad()
@@ -236,31 +440,28 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
     """
     Register hook with given shift, run forward, extract predicted ego traj
     (all modes) + best-mode index, remove hook.
-
-    Returns:
-        ego_traj_xy:  np.ndarray [N_mode, T, 2]  in ego frame (+y front, +x right)
-        best_mode:    int   argmax of ego_traj_cls_scores[-1, 0, :]
     """
-    # 1. Locate target module (handle DDP wrapper)
+    # Locate target module (handle DDP wrapper)
     base = model.module if hasattr(model, "module") else model
     target_module = base.pts_bbox_head.transformer
 
-    # 2. Register hook
+    # Make each perturbation run independent.
+    base.prev_scene_token = None
+    base.pts_bbox_head.reset_memory()
+
+    # Register hook
     hook = make_ego_ref_perturb_hook(shift_xyz)
     handle = target_module.register_forward_pre_hook(hook)
 
     try:
-        # 3. Forward.
-        # NOTE: B2D / DriveTransformer's forward_test signature may differ
         captured = {}
-
         def capture_head_out(module, inputs, output):
             # head's forward returns the dict we want
             captured["out"] = output
 
         head_handle = base.pts_bbox_head.register_forward_hook(capture_head_out)
         try:
-            _ = model(return_loss=False, rescale=True, **batch)
+            _ = model(batch, return_loss=False, rescale=True)
         finally:
             head_handle.remove()
 
@@ -274,16 +475,17 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
     finally:
         handle.remove()
 
-    # 4. Extract traj + cls
-    # ego_fut_preds_fix_time: [N_layers, B, N_mode, T, 2]
-    # ego_traj_cls_scores:     [N_layers, B, N_mode]
     traj_all = head_out["ego_fut_preds_fix_time"]
     cls_all = head_out["ego_traj_cls_scores"]
 
     # Last layer, batch 0
-    traj_last = traj_all[-1, 0].detach().cpu().numpy()       # [N_mode, T, 2]
-    cls_last = cls_all[-1, 0].detach().cpu().numpy()         # [N_mode]
-    best_mode = int(np.argmax(cls_last))
+    traj_last = traj_all[-1, 0].detach().cpu().numpy()
+    if cls_all is None:
+        best_mode = 0
+        print("[warn] ego_traj_cls_scores is None; use best_mode=0 for plotting")
+    else:
+        cls_last = cls_all[-1, 0].detach().cpu().numpy()
+        best_mode = int(np.argmax(cls_last))
 
     return traj_last, best_mode
 
@@ -302,7 +504,7 @@ def run_all_experiments(model, batch):
 
 
 # ============================================================
-# §5  Visualization
+# Visualization
 # ============================================================
 
 def project_traj_to_image(traj_xy: np.ndarray, lidar2img: np.ndarray,
@@ -310,17 +512,6 @@ def project_traj_to_image(traj_xy: np.ndarray, lidar2img: np.ndarray,
                           img_hw: tuple = None):
     """
     Project a 2D trajectory (in ego/lidar frame) onto image pixel coords.
-
-    Args:
-        traj_xy:   [T, 2]  in lidar frame  (+y front, +x right)
-        lidar2img: [4, 4]
-        z:         ground height in lidar frame (ego origin is roughly at
-                   ground level after axis convention, so z=0 is fine for viz)
-        img_hw:    optional (H, W) for additional in-bounds masking
-
-    Returns:
-        uv:   [T_visible, 2]
-        keep: [T] bool mask of which timesteps survived
     """
     T = traj_xy.shape[0]
     pts_h = np.concatenate(
@@ -431,7 +622,7 @@ def plot_dual_view(results: dict, gt_info: dict, save_path: Path):
         N_mode = traj.shape[0]
         for m in range(N_mode):
             uv, keep = project_traj_to_image(
-                traj[m], lidar2img_front, z=0.0, img_hw=(H, W)
+                traj[m], lidar2img_front, z=-1.5, img_hw=(H, W)
             )
             if keep.sum() < 2:
                 continue
@@ -451,7 +642,7 @@ def plot_dual_view(results: dict, gt_info: dict, save_path: Path):
 
 
 # ============================================================
-# §6  Main
+# Main
 # ============================================================
 
 def main():
