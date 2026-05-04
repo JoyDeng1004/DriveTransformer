@@ -50,7 +50,10 @@ EXPERIMENTS = [
 
 SAMPLE_IDX = 96
 OUTPUT_DIR = Path("./pe_diagnosis/zero_ego_pe")
-OUTPUT_FIG = OUTPUT_DIR / "fig1_trajectory_dual_view.png"
+OUTPUT_FIG1 = OUTPUT_DIR / "fig1_trajectory_dual_view.png"
+OUTPUT_FIG2 = OUTPUT_DIR / "fig2_traj_shift_by_layer.png"
+OUTPUT_FIG3 = OUTPUT_DIR / "fig3_ego_query_drift_by_layer.png"
+OUTPUT_FIG4 = OUTPUT_DIR / "fig4_ego_agent_relation_shift_by_layer.png"
 
 # Front camera index in the 6-cam list
 CAM_FRONT_IDX = 0
@@ -391,6 +394,58 @@ def load_sample(config_path: str, sample_idx: int, device: str = "cuda:0"):
 # Hook Factory
 # ============================================================
 
+def infer_query_splits(head):
+    """
+    Infer query split sizes for concatenated decoder query:
+        [agent_query, map_query, ego_query]
+
+    Returns:
+        agent_n, map_n, ego_n
+    """
+    # agent query num
+    agent_candidates = [
+        "num_query",
+        "num_agent_query",
+        "agent_query_num",
+    ]
+    map_candidates = [
+        "num_map_query",
+        "map_query_num",
+        "num_vec",
+    ]
+    ego_candidates = [
+        "ego_query_num",
+        "num_ego_query",
+        "num_modes",
+        "fut_mode",
+    ]
+
+    def get_first_attr(obj, names):
+        for n in names:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if isinstance(v, int):
+                    return v, n
+        return None, None
+
+    agent_n, agent_name = get_first_attr(head, agent_candidates)
+    map_n, map_name = get_first_attr(head, map_candidates)
+    ego_n, ego_name = get_first_attr(head, ego_candidates)
+
+    # Fallbacks from embedding shapes
+    if agent_n is None and hasattr(head, "agent_reference_points"):
+        agent_n = head.agent_reference_points.weight.shape[0]
+        agent_name = "agent_reference_points.weight.shape[0]"
+
+    if map_n is None and hasattr(head, "map_reference_points"):
+        map_n = head.map_reference_points.weight.shape[0]
+        map_name = "map_reference_points.weight.shape[0]"
+
+    # Your Zero Ego PE experiment uses N_mode ego queries.
+    # If no attr exists, infer later as tail size = total - agent_n - map_n.
+    print(f"[debug] query split attrs: agent={agent_n}({agent_name}), map={map_n}({map_name}), ego={ego_n}({ego_name})")
+    return agent_n, map_n, ego_n
+
 def make_ego_ref_perturb_hook(shift_xyz: tuple):
     """
     Closure factory: returns a forward_pre_hook that replaces ego_ref
@@ -435,73 +490,216 @@ def make_ego_ref_perturb_hook(shift_xyz: tuple):
 # Experiment Loop
 # ============================================================
 
+def tensor_from_layer_output(output):
+    """
+    Robustly extract the main query tensor from a decoder layer output.
+    """
+    if torch.is_tensor(output):
+        return output
+
+    if isinstance(output, (list, tuple)):
+        for x in output:
+            if torch.is_tensor(x) and x.dim() == 3:
+                return x
+
+    if isinstance(output, dict):
+        for x in output.values():
+            if torch.is_tensor(x) and x.dim() == 3:
+                return x
+
+    return None
+
+def find_tensor_with_token_num(obj, token_num):
+    """
+    Recursively search tensor whose shape looks like:
+        [B, token_num, D] or [token_num, B, D]
+    """
+    if token_num is None:
+        return None
+
+    if torch.is_tensor(obj) and obj.dim() == 3:
+        if obj.shape[1] == token_num:
+            return obj
+        if obj.shape[0] == token_num:
+            return obj.transpose(0, 1)
+
+    if isinstance(obj, (list, tuple)):
+        for x in obj:
+            found = find_tensor_with_token_num(x, token_num)
+            if found is not None:
+                return found
+
+    if isinstance(obj, dict):
+        for x in obj.values():
+            found = find_tensor_with_token_num(x, token_num)
+            if found is not None:
+                return found
+
+    return None
+
+
+def register_decoder_query_capture_hooks(base, agent_n=None, map_n=None, ego_n=None):
+    """
+    Capture per-layer decoder queries.
+
+    Important:
+      - output may only contain ego query
+      - agent query may exist in inputs, not output
+    """
+    decoder = base.pts_bbox_head.transformer.decoder
+    layers = decoder.layers
+
+    captures = {
+        "raw": {},
+        "agent": {},
+        "ego": {},
+    }
+    handles = []
+
+    def make_hook(layer_idx):
+        def hook_fn(module, inputs, output):
+            # -------- ego from output --------
+            q_out = tensor_from_layer_output(output)
+            if q_out is not None:
+                if q_out.dim() == 3:
+                    # Normalize to [B, N, D]
+                    if q_out.shape[1] == 1 and q_out.shape[0] != 1:
+                        q_out = q_out.transpose(0, 1)
+
+                    q_cpu = q_out.detach().float().cpu()
+                    captures["raw"][layer_idx] = q_cpu
+
+                    total_n = q_cpu.shape[1]
+                    inferred_ego_n = ego_n if ego_n is not None else min(6, total_n)
+
+                    if total_n >= inferred_ego_n:
+                        captures["ego"][layer_idx] = q_cpu[:, -inferred_ego_n:, :]
+
+                    if layer_idx == 0:
+                        print(f"[debug] layer {layer_idx} output q shape = {tuple(q_cpu.shape)}")
+
+            # -------- agent from inputs --------
+            q_agent = find_tensor_with_token_num(inputs, agent_n)
+            if q_agent is not None:
+                q_agent_cpu = q_agent.detach().float().cpu()
+                captures["agent"][layer_idx] = q_agent_cpu
+
+                if layer_idx == 0:
+                    print(f"[debug] layer {layer_idx} input agent q shape = {tuple(q_agent_cpu.shape)}")
+            else:
+                if layer_idx == 0:
+                    print(f"[warn] layer {layer_idx}: cannot find agent query in inputs with token_num={agent_n}")
+
+        return hook_fn
+
+    for i, layer in enumerate(layers):
+        handles.append(layer.register_forward_hook(make_hook(i)))
+
+    return captures, handles
+
 @torch.no_grad()
 def run_one_experiment(model, batch, shift_xyz: tuple):
     """
-    Register hook with given shift, run forward, extract predicted ego traj
-    (all modes) + best-mode index, remove hook.
+    Register ego_ref perturb hook, run forward, and collect:
+      - last-layer traj for fig1
+      - all-layer traj for fig2
+      - decoder ego/agent query captures for fig3/fig4
     """
-    # Locate target module (handle DDP wrapper)
     base = model.module if hasattr(model, "module") else model
-    target_module = base.pts_bbox_head.transformer
+    head = base.pts_bbox_head
+    target_module = head.transformer
 
     # Make each perturbation run independent.
     base.prev_scene_token = None
-    base.pts_bbox_head.reset_memory()
+    head.reset_memory()
 
-    # Register hook
+    agent_n, map_n, ego_n = infer_query_splits(head)
+
+    # Register ego_ref perturb hook
     hook = make_ego_ref_perturb_hook(shift_xyz)
     handle = target_module.register_forward_pre_hook(hook)
 
+    # Register decoder query capture hooks
+    query_captures, query_handles = register_decoder_query_capture_hooks(
+        base, agent_n=agent_n, map_n=map_n, ego_n=ego_n
+    )
+
     try:
         captured = {}
+
         def capture_head_out(module, inputs, output):
-            # head's forward returns the dict we want
             captured["out"] = output
 
-        head_handle = base.pts_bbox_head.register_forward_hook(capture_head_out)
+        head_handle = head.register_forward_hook(capture_head_out)
         try:
             _ = model(batch, return_loss=False, rescale=True)
         finally:
             head_handle.remove()
 
         head_out = captured["out"]
-        # head_out is either a dict or a tuple/list — handle both
         if isinstance(head_out, (list, tuple)):
             head_out = head_out[0] if isinstance(head_out[0], dict) else head_out
+
         assert isinstance(head_out, dict), \
             f"unexpected head_out type {type(head_out)}; inspect manually"
 
     finally:
         handle.remove()
+        for h in query_handles:
+            h.remove()
 
     traj_all = head_out["ego_fut_preds_fix_time"]
-    cls_all = head_out["ego_traj_cls_scores"]
+    cls_all = head_out.get("ego_traj_cls_scores", None)
 
-    # Last layer, batch 0
-    traj_last = traj_all[-1, 0].detach().cpu().numpy()
+    # [N_layer, B, N_mode, T, 2] -> [N_layer, N_mode, T, 2]
+    traj_layers = traj_all[:, 0].detach().float().cpu().numpy()
+    traj_last = traj_layers[-1]
+
     if cls_all is None:
         best_mode = 0
         print("[warn] ego_traj_cls_scores is None; use best_mode=0 for plotting")
     else:
-        cls_last = cls_all[-1, 0].detach().cpu().numpy()
+        cls_last = cls_all[-1, 0].detach().float().cpu().numpy()
         best_mode = int(np.argmax(cls_last))
 
-    return traj_last, best_mode
+    # Convert captured tensors to numpy dicts
+    ego_query_layers = {
+        k: v.numpy() for k, v in query_captures["ego"].items()
+    }
+    agent_query_layers = {
+        k: v.numpy() for k, v in query_captures["agent"].items()
+    }
 
+    print(
+        f"[debug] captured decoder layers: "
+        f"ego={sorted(ego_query_layers.keys())}, "
+        f"agent={sorted(agent_query_layers.keys())}"
+    )
+
+    return {
+        "traj": traj_last,                  # [N_mode, T, 2]
+        "traj_layers": traj_layers,         # [N_layer, N_mode, T, 2]
+        "best_mode": best_mode,
+        "ego_query_layers": ego_query_layers,       # dict layer -> [B, N_ego, D]
+        "agent_query_layers": agent_query_layers,   # dict layer -> [B, N_agent, D]
+    }
 
 def run_all_experiments(model, batch):
     """
-    Loop over EXPERIMENTS, return dict {group_name: (traj, best_mode)}.
+    Loop over EXPERIMENTS, return dict {group_name: result_dict}.
     """
     results = {}
     for name, shift, _color, _label in EXPERIMENTS:
         print(f"[exp] running {name} with shift={shift} ...")
-        traj, best_mode = run_one_experiment(model, batch, shift)
-        results[name] = {"traj": traj, "best_mode": best_mode, "shift": shift}
-        print(f"       traj shape={traj.shape}, best_mode={best_mode}")
+        out = run_one_experiment(model, batch, shift)
+        out["shift"] = shift
+        results[name] = out
+        print(
+            f"       traj shape={out['traj'].shape}, "
+            f"traj_layers shape={out['traj_layers'].shape}, "
+            f"best_mode={out['best_mode']}"
+        )
     return results
-
 
 # ============================================================
 # Visualization
@@ -640,6 +838,203 @@ def plot_dual_view(results: dict, gt_info: dict, save_path: Path):
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+def plot_traj_shift_by_layer(results: dict, save_path: Path):
+    """
+    Fig2:
+      x: decoder layer index
+      y: ||traj_perturbed - traj_baseline||
+
+    Norm over all modes, timesteps, xy.
+    """
+    base_name = "G0_baseline"
+    base_traj = results[base_name]["traj_layers"]  # [L, N_mode, T, 2]
+    L = base_traj.shape[0]
+    xs = np.arange(L)
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    for name, shift, color, label in EXPERIMENTS:
+        traj = results[name]["traj_layers"]
+
+        # layer-wise Frobenius norm
+        vals = []
+        for l in range(L):
+            diff = traj[l] - base_traj[l]
+            vals.append(np.linalg.norm(diff))
+
+        ax.plot(xs, vals, marker="o", color=color, label=label)
+
+    ax.set_title("Fig2: trajectory drift vs decoder layer")
+    ax.set_xlabel("decoder layer")
+    ax.set_ylabel(r"$||traj_{perturbed} - traj_{baseline}||_2$")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_ego_query_drift_by_layer(results: dict, save_path: Path):
+    """
+    Fig3:
+      x: decoder layer index
+      y: ||ego_query_perturbed - ego_query_baseline||
+
+    Norm over batch, ego modes, embedding dim.
+    """
+    base_name = "G0_baseline"
+    base_q = results[base_name]["ego_query_layers"]
+
+    common_layers = sorted(base_q.keys())
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    for name, shift, color, label in EXPERIMENTS:
+        q_dict = results[name]["ego_query_layers"]
+        layers = [l for l in common_layers if l in q_dict]
+
+        vals = []
+        for l in layers:
+            diff = q_dict[l] - base_q[l]
+            vals.append(np.linalg.norm(diff))
+
+        ax.plot(layers, vals, marker="o", color=color, label=label)
+
+    ax.set_title("Fig3: ego query embedding drift vs decoder layer")
+    ax.set_xlabel("decoder layer")
+    ax.set_ylabel(r"$||ego\_query_{perturbed} - ego\_query_{baseline}||_2$")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def softmax_np(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+
+def ego_agent_relation_distribution(ego_q, agent_q, temperature=1.0):
+    """
+    ego_q:   [B, N_ego, D]
+    agent_q: [B, N_agent, D]
+
+    Return:
+        prob: [B, N_ego, N_agent]
+    """
+    eps = 1e-8
+    ego = ego_q / (np.linalg.norm(ego_q, axis=-1, keepdims=True) + eps)
+    agent = agent_q / (np.linalg.norm(agent_q, axis=-1, keepdims=True) + eps)
+
+    # [B, N_ego, D] x [B, D, N_agent] -> [B, N_ego, N_agent]
+    sim = np.matmul(ego, np.swapaxes(agent, -1, -2)) / temperature
+    prob = softmax_np(sim, axis=-1)
+    return prob
+
+
+def kl_divergence_np(p, q, eps=1e-8):
+    """
+    Mean KL(p || q) over B and ego modes.
+    p/q: [B, N_ego, N_agent]
+    """
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    kl = np.sum(p * (np.log(p) - np.log(q)), axis=-1)  # [B, N_ego]
+    return float(np.mean(kl))
+
+
+def plot_ego_agent_relation_shift_by_layer(results: dict, save_path: Path):
+    """
+    Fig4:
+      x: decoder layer index
+      y: KL between perturbed and baseline ego-agent relation distributions.
+
+    This is a proxy, not raw attention weights.
+    """
+    base_name = "G0_baseline"
+    base_ego = results[base_name]["ego_query_layers"]
+    base_agent = results[base_name]["agent_query_layers"]
+
+    common_layers = sorted(set(base_ego.keys()) & set(base_agent.keys()))
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    for name, shift, color, label in EXPERIMENTS:
+        ego_dict = results[name]["ego_query_layers"]
+        agent_dict = results[name]["agent_query_layers"]
+
+        layers = [
+            l for l in common_layers
+            if l in ego_dict and l in agent_dict
+        ]
+
+        vals = []
+        for l in layers:
+            p_base = ego_agent_relation_distribution(base_ego[l], base_agent[l])
+            p_pert = ego_agent_relation_distribution(ego_dict[l], agent_dict[l])
+            vals.append(kl_divergence_np(p_pert, p_base))
+
+        ax.plot(layers, vals, marker="o", color=color, label=label)
+
+    ax.set_title("Fig4: ego-agent relation redistribution vs decoder layer")
+    ax.set_xlabel("decoder layer")
+    ax.set_ylabel("KL(perturbed || baseline)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def ego_self_relation_distribution(ego_q, temperature=1.0):
+    """
+    ego_q: [B, N_ego, D]
+    Return:
+        prob: [B, N_ego, N_ego]
+    """
+    eps = 1e-8
+    ego = ego_q / (np.linalg.norm(ego_q, axis=-1, keepdims=True) + eps)
+    sim = np.matmul(ego, np.swapaxes(ego, -1, -2)) / temperature
+    prob = softmax_np(sim, axis=-1)
+    return prob
+
+
+def plot_ego_self_relation_shift_by_layer(results: dict, save_path: Path):
+    """
+    Fallback Fig4:
+      x: decoder layer index
+      y: KL between perturbed and baseline ego-mode relation distributions.
+
+    This is not ego-agent attention.
+    It measures whether Zero Ego PE changes relation among ego modes.
+    """
+    base_name = "G0_baseline"
+    base_ego = results[base_name]["ego_query_layers"]
+
+    common_layers = sorted(base_ego.keys())
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    for name, shift, color, label in EXPERIMENTS:
+        ego_dict = results[name]["ego_query_layers"]
+        layers = [l for l in common_layers if l in ego_dict]
+
+        vals = []
+        for l in layers:
+            p_base = ego_self_relation_distribution(base_ego[l])
+            p_pert = ego_self_relation_distribution(ego_dict[l])
+            vals.append(kl_divergence_np(p_pert, p_base))
+
+        ax.plot(layers, vals, marker="o", color=color, label=label)
+
+    ax.set_title("Fig4 fallback: ego-mode relation redistribution vs decoder layer")
+    ax.set_xlabel("decoder layer")
+    ax.set_ylabel("KL(perturbed || baseline)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 # ============================================================
 # Main
@@ -666,8 +1061,18 @@ def main():
     results = run_all_experiments(model, batch)
 
     print("[4/4] plotting ...")
-    plot_dual_view(results, gt_info, OUTPUT_FIG)
-    print(f"saved -> {OUTPUT_FIG}")
+    plot_dual_view(results, gt_info, OUTPUT_FIG1)
+    print(f"saved -> {OUTPUT_FIG1}")
+
+    plot_traj_shift_by_layer(results, OUTPUT_FIG2)
+    print(f"saved -> {OUTPUT_FIG2}")
+
+    plot_ego_query_drift_by_layer(results, OUTPUT_FIG3)
+    print(f"saved -> {OUTPUT_FIG3}")
+
+    # plot_ego_agent_relation_shift_by_layer(results, OUTPUT_FIG4)
+    plot_ego_self_relation_shift_by_layer(results, OUTPUT_FIG4)
+    print(f"saved -> {OUTPUT_FIG4}")
 
 
 if __name__ == "__main__":
