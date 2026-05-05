@@ -36,13 +36,11 @@ from planner_sensitivity_report import run_basic_sensitivity_report
 #               map_temp_memory, map_temp_pos, ego_memory_embedding,
 #               ego_temp_pos, agent_prep_ref, map_prep_ref,
 #               map_prep_pts_coord, ego_ref, ...)
-# 0-based index: ego_ref is the 15th positional arg => idx = 14
 EGO_REF_ARG_IDX = 14
 AGENT_QUERY_ARG_IDX = 0
 MAP_QUERY_ARG_IDX = 1
 EGO_QUERY_ARG_IDX = 2
 
-# Coordinate system (confirmed in Step 2a-bis):
 #   +y = front, -y = back, +x = right, -x = left, units = meters
 # point_cloud_range: x ∈ [-15, 15], y ∈ [-30, 30]
 EXPERIMENTS = [
@@ -676,10 +674,6 @@ def tensor_from_layer_output(output):
     return None
 
 def find_tensor_with_token_num(obj, token_num):
-    """
-    Recursively search tensor whose shape looks like:
-        [B, token_num, D] or [token_num, B, D]
-    """
     if token_num is None:
         return None
 
@@ -1326,7 +1320,6 @@ def ego_self_relation_distribution(ego_q, temperature=1.0):
     sim = np.matmul(ego, np.swapaxes(ego, -1, -2)) / temperature
     prob = softmax_np(sim, axis=-1)
     return prob
-
 
 def plot_ego_self_relation_shift_by_layer(results: dict, save_path: Path):
     """
