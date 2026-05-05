@@ -23,8 +23,10 @@ import matplotlib.patches as patches
 import inspect
 import types
 
+from planner_sensitivity_report import run_basic_sensitivity_report
+
 # ============================================================
-# §0  Constants & Experiment Config
+# S0: Constants & Experiment Config
 # ============================================================
 
 # Position of ego_ref in pts_bbox_head.transformer's positional args.
@@ -36,17 +38,49 @@ import types
 #               map_prep_pts_coord, ego_ref, ...)
 # 0-based index: ego_ref is the 15th positional arg => idx = 14
 EGO_REF_ARG_IDX = 14
+AGENT_QUERY_ARG_IDX = 0
+MAP_QUERY_ARG_IDX = 1
+EGO_QUERY_ARG_IDX = 2
 
 # Coordinate system (confirmed in Step 2a-bis):
 #   +y = front, -y = back, +x = right, -x = left, units = meters
 # point_cloud_range: x ∈ [-15, 15], y ∈ [-30, 30]
 EXPERIMENTS = [
-    # (group_name, shift_xyz, color, label)
-    ("G0_baseline",  (0.0,  0.0, 0.0), "black",   "baseline (0,0,0)"),
-    ("G1_front+5",   (0.0,  5.0, 0.0), "tab:blue",   "ego↑ front +5m"),
-    ("G2_back-5",    (0.0, -5.0, 0.0), "tab:red",    "ego↓ back -5m"),
-    ("G3_right+5",   (5.0,  0.0, 0.0), "tab:green",  "ego→ right +5m"),
+    # name, ego_ref_shift_xyz, color, label
+    ("G0_baseline",          (0.0, 0.0, 0.0), "black",      "G0 baseline"),
+    ("G1_ego_ref_shift_x2",  (2.0, 0.0, 0.0), "tab:blue",   "G1 ego_ref x+2m"),
+    ("G2_ego_his_zero",      (0.0, 0.0, 0.0), "tab:orange", "G2 ego_his zero"),
+    ("G3_ego_lcf_zero",      (0.0, 0.0, 0.0), "tab:green",  "G3 ego_lcf zero"),
+    ("G4_map_query_mask",    (0.0, 0.0, 0.0), "tab:red",    "G4 map query mask"),
+    ("G5_agent_query_mask",  (0.0, 0.0, 0.0), "tab:purple", "G5 agent query mask"),
 ]
+
+INTERVENTIONS = {
+    "G0_baseline": {
+        "type": "none",
+    },
+    "G1_ego_ref_shift_x2": {
+        "type": "ego_ref_shift",
+    },
+    "G2_ego_his_zero": {
+        "type": "batch_zero",
+        "batch_key": "ego_his_trajs",
+    },
+    "G3_ego_lcf_zero": {
+        "type": "batch_zero",
+        "batch_key": "ego_lcf_feat",
+    },
+    "G4_map_query_mask": {
+        "type": "query_mask",
+        "arg_idx": MAP_QUERY_ARG_IDX,
+        "target": "map_query",
+    },
+    "G5_agent_query_mask": {
+        "type": "query_mask",
+        "arg_idx": AGENT_QUERY_ARG_IDX,
+        "target": "agent_query",
+    },
+}
 
 SAMPLE_IDX = 96
 OUTPUT_DIR = Path("./pe_diagnosis/zero_ego_pe")
@@ -60,7 +94,7 @@ CAM_FRONT_IDX = 0
 
 
 # ============================================================
-# Model Loading
+# S1: Model Loading
 # ============================================================
 
 def patch_single_arg_ffns_for_identity(model):
@@ -127,7 +161,7 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda:0"):
 
 
 # ============================================================
-# Data Loading
+# S2: Data Loading
 # ============================================================
 
 def load_sample(config_path: str, sample_idx: int, device: str = "cuda:0"):
@@ -390,9 +424,66 @@ def load_sample(config_path: str, sample_idx: int, device: str = "cuda:0"):
                 print(f"[debug] before forward {key}: len={len(v)}, elem_type={type(v[0])}")
     return model_batch, gt_info
 
+def clone_batch_for_intervention(x):
+    """
+    Clone batch recursively so each intervention run is independent.
+
+    Important:
+      - torch.Tensor is cloned.
+      - dict/list/tuple are recursively cloned.
+      - non-tensor objects are deep-copied.
+    """
+    if torch.is_tensor(x):
+        return x.clone()
+    if isinstance(x, dict):
+        return {k: clone_batch_for_intervention(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [clone_batch_for_intervention(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(clone_batch_for_intervention(v) for v in x)
+    return copy.deepcopy(x)
+
+def zero_like_nested(x):
+    """
+    Recursively zero tensors / arrays inside a nested object.
+    """
+    if torch.is_tensor(x):
+        return torch.zeros_like(x)
+    if isinstance(x, np.ndarray):
+        return np.zeros_like(x)
+    if isinstance(x, dict):
+        return {k: zero_like_nested(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [zero_like_nested(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(zero_like_nested(v) for v in x)
+    return x
+
+
 # ============================================================
-# Hook Factory
+# S3: Intervention Hooks
 # ============================================================
+def apply_batch_zero_intervention(batch, batch_key):
+    """
+    Zero out a top-level batch field, e.g. ego_his_trajs or ego_lcf_feat.
+    """
+    if batch_key not in batch:
+        print(f"[warn] batch key '{batch_key}' not found; skip zero intervention.")
+        print(f"[debug] available batch keys = {sorted(batch.keys())}")
+        return batch
+
+    old_v = batch[batch_key]
+    batch[batch_key] = zero_like_nested(old_v)
+
+    print(f"[intervention] zero-out batch['{batch_key}']")
+    if torch.is_tensor(old_v):
+        print(f"  old shape={tuple(old_v.shape)}, dtype={old_v.dtype}, device={old_v.device}")
+    elif isinstance(old_v, list):
+        print(f"  old type=list, len={len(old_v)}, elem_type={type(old_v[0]) if len(old_v) > 0 else None}")
+    else:
+        print(f"  old type={type(old_v)}")
+
+    return batch
 
 def infer_query_splits(head):
     """
@@ -416,8 +507,6 @@ def infer_query_splits(head):
     ego_candidates = [
         "ego_query_num",
         "num_ego_query",
-        "num_modes",
-        "fut_mode",
     ]
 
     def get_first_attr(obj, names):
@@ -433,6 +522,10 @@ def infer_query_splits(head):
     ego_n, ego_name = get_first_attr(head, ego_candidates)
 
     # Fallbacks from embedding shapes
+    if ego_n is None:
+        ego_n = 1
+        ego_name = "fallback_planning_query_token_num"
+
     if agent_n is None and hasattr(head, "agent_reference_points"):
         agent_n = head.agent_reference_points.weight.shape[0]
         agent_name = "agent_reference_points.weight.shape[0]"
@@ -441,10 +534,56 @@ def infer_query_splits(head):
         map_n = head.map_reference_points.weight.shape[0]
         map_name = "map_reference_points.weight.shape[0]"
 
+    #   agent_n = num_query - map_n
+    if agent_n is not None and map_n is not None and agent_n > map_n:
+        if hasattr(head, "num_query") and agent_name == "num_query":
+            old_agent_n = agent_n
+            agent_n = agent_n - map_n
+            print(
+                f"[fix] head.num_query appears to be agent+map total: "
+                f"{old_agent_n} - map_n({map_n}) = agent_n({agent_n})"
+            )
+
     # Your Zero Ego PE experiment uses N_mode ego queries.
     # If no attr exists, infer later as tail size = total - agent_n - map_n.
     print(f"[debug] query split attrs: agent={agent_n}({agent_name}), map={map_n}({map_name}), ego={ego_n}({ego_name})")
     return agent_n, map_n, ego_n
+
+def make_transformer_input_capture_hook(captures: dict):
+    """
+    Capture task queries at pts_bbox_head.transformer forward input.
+
+    This is more reliable for ego_query than decoder layer inputs, because
+    ego_query may not be passed as a normal tensor into each decoder layer.
+    """
+    def hook_fn(module, inputs):
+        assert isinstance(inputs, tuple), f"expected tuple inputs, got {type(inputs)}"
+
+        # agent_query: arg0, [B, N_agent, D]
+        if len(inputs) > AGENT_QUERY_ARG_IDX and torch.is_tensor(inputs[AGENT_QUERY_ARG_IDX]):
+            captures["transformer_input_agent_query"] = (
+                inputs[AGENT_QUERY_ARG_IDX].detach().float().cpu().numpy()
+            )
+
+        # map_query: arg1, [B, N_map, D]
+        if len(inputs) > MAP_QUERY_ARG_IDX and torch.is_tensor(inputs[MAP_QUERY_ARG_IDX]):
+            captures["transformer_input_map_query"] = (
+                inputs[MAP_QUERY_ARG_IDX].detach().float().cpu().numpy()
+            )
+
+        # ego_query: arg2, [B, N_ego, D] or maybe [B, D]
+        if len(inputs) > EGO_QUERY_ARG_IDX and torch.is_tensor(inputs[EGO_QUERY_ARG_IDX]):
+            ego_q = inputs[EGO_QUERY_ARG_IDX]
+            captures["transformer_input_ego_query"] = (
+                ego_q.detach().float().cpu().numpy()
+            )
+            print(f"[debug] transformer input ego_query shape = {tuple(ego_q.shape)}")
+        else:
+            print("[warn] transformer input ego_query not found at arg_idx=2")
+
+        return None
+
+    return hook_fn
 
 def make_ego_ref_perturb_hook(shift_xyz: tuple):
     """
@@ -485,9 +624,36 @@ def make_ego_ref_perturb_hook(shift_xyz: tuple):
 
     return hook_fn
 
+def make_query_mask_hook(arg_idx: int, target_name: str):
+    """
+    Return a forward_pre_hook that zeros one transformer input query.
+
+    Example:
+        arg_idx = 0 -> agent_query
+        arg_idx = 1 -> map_query
+
+    Note:
+        This masks the initial task query content passed into transformer.
+        It is a first-stage coarse ablation, not yet a perfect removal of
+        all map/agent information.
+    """
+    def hook_fn(module, inputs):
+        assert isinstance(inputs, tuple), f"expected tuple inputs, got {type(inputs)}"
+        assert len(inputs) > arg_idx, f"inputs has only {len(inputs)} args, need idx {arg_idx}"
+
+        q = inputs[arg_idx]
+        assert torch.is_tensor(q), f"{target_name} is not tensor, got {type(q)}"
+
+        print(f"[intervention] mask {target_name}: shape={tuple(q.shape)}")
+
+        new_inputs = list(inputs)
+        new_inputs[arg_idx] = torch.zeros_like(q)
+        return tuple(new_inputs)
+
+    return hook_fn
 
 # ============================================================
-# Experiment Loop
+# S4: Query Capture Hooks
 # ============================================================
 
 def tensor_from_layer_output(output):
@@ -542,9 +708,11 @@ def register_decoder_query_capture_hooks(base, agent_n=None, map_n=None, ego_n=N
     """
     Capture per-layer decoder queries.
 
-    Important:
-      - output may only contain ego query
-      - agent query may exist in inputs, not output
+    DriveTransformerDecoderLayer.forward() returns a tuple:
+        (agent_query[B,900,768], map_query[B,100,768], ego_query[B,1,768])
+
+    We directly index output[0], output[1], output[2] for reliable capture.
+    Fallback to find_tensor_with_token_num only if output is not a 3-tuple.
     """
     decoder = base.pts_bbox_head.transformer.decoder
     layers = decoder.layers
@@ -552,43 +720,67 @@ def register_decoder_query_capture_hooks(base, agent_n=None, map_n=None, ego_n=N
     captures = {
         "raw": {},
         "agent": {},
+        "map": {},
         "ego": {},
     }
     handles = []
 
     def make_hook(layer_idx):
         def hook_fn(module, inputs, output):
-            # -------- ego from output --------
-            q_out = tensor_from_layer_output(output)
-            if q_out is not None:
-                if q_out.dim() == 3:
-                    # Normalize to [B, N, D]
-                    if q_out.shape[1] == 1 and q_out.shape[0] != 1:
-                        q_out = q_out.transpose(0, 1)
+            # DriveTransformerDecoderLayer returns (agent_query, map_query, ego_query)
+            if isinstance(output, (list, tuple)) and len(output) >= 3:
+                # -------- agent from output[0] --------
+                q_agent = output[0]
+                if torch.is_tensor(q_agent) and q_agent.dim() == 3:
+                    q_agent_cpu = q_agent.detach().float().cpu()
+                    captures["agent"][layer_idx] = q_agent_cpu
+                    if layer_idx == 0:
+                        print(f"[debug] layer {layer_idx} output agent_query shape = {tuple(q_agent_cpu.shape)}")
 
+                # -------- map from output[1] --------
+                q_map = output[1]
+                if torch.is_tensor(q_map) and q_map.dim() == 3:
+                    q_map_cpu = q_map.detach().float().cpu()
+                    captures["map"][layer_idx] = q_map_cpu
+                    if layer_idx == 0:
+                        print(f"[debug] layer {layer_idx} output map_query shape = {tuple(q_map_cpu.shape)}")
+
+                # -------- ego from output[2] --------
+                q_ego = output[2]
+                if torch.is_tensor(q_ego) and q_ego.dim() == 3:
+                    q_ego_cpu = q_ego.detach().float().cpu()
+                    captures["ego"][layer_idx] = q_ego_cpu
+                    if layer_idx == 0:
+                        print(f"[debug] layer {layer_idx} output ego_query shape = {tuple(q_ego_cpu.shape)}")
+
+                # Also store raw (agent) for backward compat
+                captures["raw"][layer_idx] = captures["agent"].get(layer_idx)
+
+            else:
+                # Fallback: output is not a 3-tuple (unexpected architecture)
+                q_out = tensor_from_layer_output(output)
+                if q_out is not None and q_out.dim() == 3:
                     q_cpu = q_out.detach().float().cpu()
                     captures["raw"][layer_idx] = q_cpu
-
-                    total_n = q_cpu.shape[1]
-                    inferred_ego_n = ego_n if ego_n is not None else min(6, total_n)
-
-                    if total_n >= inferred_ego_n:
-                        captures["ego"][layer_idx] = q_cpu[:, -inferred_ego_n:, :]
-
                     if layer_idx == 0:
-                        print(f"[debug] layer {layer_idx} output q shape = {tuple(q_cpu.shape)}")
+                        print(f"[debug] layer {layer_idx} output q shape = {tuple(q_cpu.shape)} (fallback)")
 
-            # -------- agent from inputs --------
-            q_agent = find_tensor_with_token_num(inputs, agent_n)
-            if q_agent is not None:
-                q_agent_cpu = q_agent.detach().float().cpu()
-                captures["agent"][layer_idx] = q_agent_cpu
+                # Try to find agent/map from inputs
+                q_agent = find_tensor_with_token_num(inputs, agent_n)
+                if q_agent is not None:
+                    captures["agent"][layer_idx] = q_agent.detach().float().cpu()
+                elif layer_idx == 0:
+                    print(f"[warn] layer {layer_idx}: cannot find agent query (fallback)")
 
+                q_map = find_tensor_with_token_num(inputs, map_n)
+                if q_map is not None:
+                    captures["map"][layer_idx] = q_map.detach().float().cpu()
+                elif layer_idx == 0:
+                    print(f"[warn] layer {layer_idx}: cannot find map query (fallback)")
+
+                # ego not capturable in fallback path
                 if layer_idx == 0:
-                    print(f"[debug] layer {layer_idx} input agent q shape = {tuple(q_agent_cpu.shape)}")
-            else:
-                if layer_idx == 0:
-                    print(f"[warn] layer {layer_idx}: cannot find agent query in inputs with token_num={agent_n}")
+                    print(f"[warn] layer {layer_idx}: cannot find ego query (output not a 3-tuple)")
 
         return hook_fn
 
@@ -597,13 +789,34 @@ def register_decoder_query_capture_hooks(base, agent_n=None, map_n=None, ego_n=N
 
     return captures, handles
 
-@torch.no_grad()
-def run_one_experiment(model, batch, shift_xyz: tuple):
+def stack_layer_dict(layer_dict):
     """
-    Register ego_ref perturb hook, run forward, and collect:
-      - last-layer traj for fig1
-      - all-layer traj for fig2
-      - decoder ego/agent query captures for fig3/fig4
+    Convert {layer_idx: [B, N, D]} to [L, B, N, D].
+
+    If empty, return None.
+    """
+    if layer_dict is None or len(layer_dict) == 0:
+        return None
+
+    layers = sorted(layer_dict.keys())
+    arrs = [layer_dict[l] for l in layers]
+    return np.stack(arrs, axis=0)
+
+
+# ============================================================
+# S5: Experiment Runner
+# ============================================================
+
+@torch.no_grad()
+def run_one_experiment(model, batch, name: str, shift_xyz: tuple, intervention: dict):
+    """
+    Run one G0-G5 intervention experiment.
+
+    Collect:
+      - traj: final-layer trajectory, [N_mode, T, 2]
+      - traj_layers: all-layer trajectory, [N_layer, N_mode, T, 2]
+      - ego_query / agent_query / map_query: stacked decoder-layer queries
+      - legacy ego_query_layers / agent_query_layers / map_query_layers
     """
     base = model.module if hasattr(model, "module") else model
     head = base.pts_bbox_head
@@ -615,14 +828,42 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
 
     agent_n, map_n, ego_n = infer_query_splits(head)
 
-    # Register ego_ref perturb hook
-    hook = make_ego_ref_perturb_hook(shift_xyz)
-    handle = target_module.register_forward_pre_hook(hook)
+    # Clone batch so batch-level interventions do not contaminate later runs.
+    run_batch = clone_batch_for_intervention(batch)
+
+    intervention_type = intervention.get("type", "none")
+    handles = []
+
+    # 1) Batch-level intervention
+    if intervention_type == "batch_zero":
+        batch_key = intervention["batch_key"]
+        run_batch = apply_batch_zero_intervention(run_batch, batch_key)
+
+    # 2) ego_ref shift intervention
+    # For G0/G2/G3/G4/G5 shift is usually zero, but using the hook is fine
+    # because the hook also sanity-checks that ego_ref is really zero.
+    if intervention_type == "ego_ref_shift" or shift_xyz != (0.0, 0.0, 0.0):
+        hook = make_ego_ref_perturb_hook(shift_xyz)
+        handles.append(target_module.register_forward_pre_hook(hook))
+
+    # 3) Query-level intervention: mask agent_query or map_query at transformer input.
+    if intervention_type == "query_mask":
+        arg_idx = intervention["arg_idx"]
+        target_name = intervention.get("target", f"arg_{arg_idx}")
+        hook = make_query_mask_hook(arg_idx=arg_idx, target_name=target_name)
+        handles.append(target_module.register_forward_pre_hook(hook))
+
+    # 4) Capture transformer input queries, especially ego_query.
+    transformer_input_captures = {}
+    input_capture_hook = make_transformer_input_capture_hook(transformer_input_captures)
+    handles.append(target_module.register_forward_pre_hook(input_capture_hook))
 
     # Register decoder query capture hooks
     query_captures, query_handles = register_decoder_query_capture_hooks(
         base, agent_n=agent_n, map_n=map_n, ego_n=ego_n
     )
+
+    handles.extend(query_handles)
 
     try:
         captured = {}
@@ -631,12 +872,14 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
             captured["out"] = output
 
         head_handle = head.register_forward_hook(capture_head_out)
+
         try:
-            _ = model(batch, return_loss=False, rescale=True)
+            _ = model(run_batch, return_loss=False, rescale=True)
         finally:
             head_handle.remove()
 
         head_out = captured["out"]
+
         if isinstance(head_out, (list, tuple)):
             head_out = head_out[0] if isinstance(head_out[0], dict) else head_out
 
@@ -644,10 +887,23 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
             f"unexpected head_out type {type(head_out)}; inspect manually"
 
     finally:
-        handle.remove()
-        for h in query_handles:
+        for h in handles:
             h.remove()
 
+    # ---- Extract trajectory predictions ----
+    # Generation chain for ego_fut_preds_fix_time:
+    #   ego_query (from decoder output[2]) -> ego_planning_head (MLP)
+    #   -> ego_fut_preds_fix_time [N_layer, B, N_mode, T, 2]
+    #
+    # The planning head decodes ego_query at each decoder layer into
+    # multi-mode future trajectories (x,y offsets at T timesteps).
+    # cls_scores rank the modes by confidence.
+    # ---- Trajectory extraction ----
+    # ego_fut_preds_fix_time is generated by:
+    #   DriveTransformerHead.forward() -> DriveTransformerDecoder.forward()
+    #   -> ego_query passes through N decoder layers -> ego_planning_head MLP
+    #   -> output shape: [N_layer, B, N_mode, T, 2]  (x,y in ego frame)
+    # See: drivetransformer_head.py, drivetransformer_decoder.py
     traj_all = head_out["ego_fut_preds_fix_time"]
     cls_all = head_out.get("ego_traj_cls_scores", None)
 
@@ -669,40 +925,113 @@ def run_one_experiment(model, batch, shift_xyz: tuple):
     agent_query_layers = {
         k: v.numpy() for k, v in query_captures["agent"].items()
     }
+    map_query_layers = {
+        k: v.numpy() for k, v in query_captures["map"].items()
+    }
 
     print(
         f"[debug] captured decoder layers: "
         f"ego={sorted(ego_query_layers.keys())}, "
-        f"agent={sorted(agent_query_layers.keys())}"
+        f"agent={sorted(agent_query_layers.keys())}, "
+        f"map={sorted(map_query_layers.keys())}"
     )
 
+    # These stacked versions are for planner_sensitivity_report.py
+    ego_query = stack_layer_dict(ego_query_layers)
+    agent_query = stack_layer_dict(agent_query_layers)
+    map_query = stack_layer_dict(map_query_layers)
+
+    # Fallback: ego_query is often not present in decoder layer inputs.
+    # Use transformer input ego_query so fig_D1 can still summarize ego-query sensitivity.
+    ego_query_is_layerwise = ego_query is not None
+    ego_query_source = "decoder_layer_output[2]" if ego_query_is_layerwise else None
+
+    if ego_query is None:
+        ego_query = transformer_input_captures.get("transformer_input_ego_query", None)
+        if ego_query is not None:
+            ego_query_source = "transformer_input_fallback"
+            print(f"[fix] use transformer input ego_query as fallback: shape={ego_query.shape}")
+
+    # Transformer input ego_query (always captured for reference)
+    transformer_input_ego_query = transformer_input_captures.get("transformer_input_ego_query", None)
+
     return {
+        # New report-compatible keys
         "traj": traj_last,                  # [N_mode, T, 2]
+        "ego_query": ego_query,             # [L, B, N_ego, D] or None
+        "agent_query": agent_query,         # [L, B, N_agent, D] or None
+        "map_query": map_query,             # [L, B, N_map, D] or None
+        "ego_query_is_layerwise": ego_query_is_layerwise,
+        "ego_query_source": ego_query_source,
+        "transformer_input_ego_query": transformer_input_ego_query,
+        "meta": {
+            "label": dict((e[0], e[3]) for e in EXPERIMENTS).get(name, name),
+            "color": dict((e[0], e[2]) for e in EXPERIMENTS).get(name, None),
+            "perturb_type": intervention_type,
+        },
+
+        # Legacy keys for old figures
         "traj_layers": traj_layers,         # [N_layer, N_mode, T, 2]
         "best_mode": best_mode,
-        "ego_query_layers": ego_query_layers,       # dict layer -> [B, N_ego, D]
-        "agent_query_layers": agent_query_layers,   # dict layer -> [B, N_agent, D]
+        "shift": shift_xyz,
+        "ego_query_layers": ego_query_layers,
+        "agent_query_layers": agent_query_layers,
+        "map_query_layers": map_query_layers,
     }
 
 def run_all_experiments(model, batch):
     """
-    Loop over EXPERIMENTS, return dict {group_name: result_dict}.
+    Loop over G0-G5 experiments, return dict {group_name: result_dict}.
     """
     results = {}
-    for name, shift, _color, _label in EXPERIMENTS:
-        print(f"[exp] running {name} with shift={shift} ...")
-        out = run_one_experiment(model, batch, shift)
-        out["shift"] = shift
-        results[name] = out
-        print(
-            f"       traj shape={out['traj'].shape}, "
-            f"traj_layers shape={out['traj_layers'].shape}, "
-            f"best_mode={out['best_mode']}"
+
+    for name, shift, color, label in EXPERIMENTS:
+        intervention = INTERVENTIONS.get(name, {"type": "none"})
+
+        print("=" * 80)
+        print(f"[exp] running {name}")
+        print(f"      label={label}")
+        print(f"      shift={shift}")
+        print(f"      intervention={intervention}")
+
+        out = run_one_experiment(
+            model=model,
+            batch=batch,
+            name=name,
+            shift_xyz=shift,
+            intervention=intervention,
         )
+
+        # Make sure meta is aligned with EXPERIMENTS.
+        out["meta"] = {
+            "label": label,
+            "color": color,
+            "perturb_type": intervention.get("type", "none"),
+        }
+        out["shift"] = shift
+
+        results[name] = out
+
+        # Sanity-check logging
+        _eq = out['ego_query']
+        _aq = out['agent_query']
+        _mq = out['map_query']
+        _tieq = out.get('transformer_input_ego_query')
+        print(
+            f"[done] {name}:\n"
+            f"  traj={out['traj'].shape}\n"
+            f"  traj_layers={out['traj_layers'].shape}\n"
+            f"  layerwise_ego_query={None if _eq is None else _eq.shape}, "
+            f"source={out.get('ego_query_source', 'N/A')}\n"
+            f"  layerwise_agent_query={None if _aq is None else _aq.shape}\n"
+            f"  layerwise_map_query={None if _mq is None else _mq.shape}\n"
+            f"  transformer_input_ego_query={None if _tieq is None else _tieq.shape}"
+        )
+
     return results
 
 # ============================================================
-# Visualization
+# S8: Legacy Plots
 # ============================================================
 
 def project_traj_to_image(traj_xy: np.ndarray, lidar2img: np.ndarray,
@@ -1037,7 +1366,7 @@ def plot_ego_self_relation_shift_by_layer(results: dict, save_path: Path):
     plt.close(fig)
 
 # ============================================================
-# Main
+# S9: Main
 # ============================================================
 
 def main():
@@ -1060,6 +1389,23 @@ def main():
     print("[3/4] running experiments ...")
     results = run_all_experiments(model, batch)
 
+    print("[3.5/4] generating planner sensitivity report ...")
+    sensitivity_out_dir = OUTPUT_DIR / "planner_sensitivity_g0_g5"
+
+    rows, metrics_by_name = run_basic_sensitivity_report(
+        results=results,
+        out_dir=str(sensitivity_out_dir),
+        baseline_key="G0_baseline",
+        mode_idx=0,
+        reduce_mode="select",
+        sort_by="final_point_error",
+        attach_meta=True,
+        save_results_pickle=True,
+        make_query_drift=True,
+    )
+
+    print(f"[report] saved planner sensitivity report -> {sensitivity_out_dir}")
+
     print("[4/4] plotting ...")
     plot_dual_view(results, gt_info, OUTPUT_FIG1)
     print(f"saved -> {OUTPUT_FIG1}")
@@ -1067,8 +1413,13 @@ def main():
     plot_traj_shift_by_layer(results, OUTPUT_FIG2)
     print(f"saved -> {OUTPUT_FIG2}")
 
-    plot_ego_query_drift_by_layer(results, OUTPUT_FIG3)
-    print(f"saved -> {OUTPUT_FIG3}")
+    # Guard: only plot layerwise ego_query drift if capture was from decoder layers
+    baseline_ego_layerwise = results.get("G0_baseline", {}).get("ego_query_is_layerwise", False)
+    if baseline_ego_layerwise:
+        plot_ego_query_drift_by_layer(results, OUTPUT_FIG3)
+        print(f"saved -> {OUTPUT_FIG3}")
+    else:
+        print(f"[SKIP] fig3 ego_query drift: ego_query_is_layerwise=False")
 
     # plot_ego_agent_relation_shift_by_layer(results, OUTPUT_FIG4)
     plot_ego_self_relation_shift_by_layer(results, OUTPUT_FIG4)
