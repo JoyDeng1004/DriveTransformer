@@ -4,11 +4,6 @@ Usage: python ego_ref_shift_diag.py \
   --ckpt /gs/bs/tga-RLA/qdeng/DriveTransformer/ckpts/drivetransformer_large.pth \
   --sample-idx 96 \
   --device cuda:0
-
-Pipeline: load model -> load sample 96 -> for each shift: register hook,
-          forward, collect ego traj -> plot dual-view figure.
-
-Output: ./pe_diagnosis/zero_ego_pe/fig1_trajectory_dual_view.png
 """
 
 import os
