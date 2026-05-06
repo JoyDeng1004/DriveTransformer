@@ -27,6 +27,7 @@ from mmcv.utils import load_checkpoint
 from mmcv.utils import Config
 from mmcv.datasets import build_dataset
 from mmcv.models import build_model
+import types
 
 
 def make_se2_delta(dx: float, dy: float, dtheta: float) -> np.ndarray:
@@ -182,6 +183,47 @@ def reset_model_memory(model):
     if hasattr(m, "reset_memory"):
         m.reset_memory()
 
+def patch_swiglu_ffn_forward_compat(model):
+    """
+    DriveTransformerPreDecoderLayer calls:
+        self.ffns[ffn_index](query, None)
+
+    But DriveTransformer's custom SwiGLULayer.forward only accepts:
+        forward(self, x)
+
+    We cannot edit model source files in this debug script, so we monkey-patch
+    SwiGLULayer instances to ignore extra positional/keyword args.
+    """
+    patched = 0
+
+    for module in model.modules():
+        # Avoid importing internal class name if possible.
+        # Match by class name + key attributes to reduce accidental patching.
+        is_swiglu_layer = (
+            module.__class__.__name__ == "SwiGLULayer"
+            and hasattr(module, "swiglu")
+            and hasattr(module, "prenorm")
+        )
+
+        if not is_swiglu_layer:
+            continue
+
+        if getattr(module, "_se2_oracle_forward_patched", False):
+            continue
+
+        old_forward = module.forward
+
+        def new_forward(self, x, *args, _old_forward=old_forward, **kwargs):
+            # Ignore the extra identity=None argument passed by PreDecoderLayer.
+            return _old_forward(x)
+
+        module.forward = types.MethodType(new_forward, module)
+        module._se2_oracle_forward_patched = True
+        patched += 1
+
+    print(f"[patch] patched {patched} SwiGLULayer.forward methods to ignore extra args")
+    return patched
+
 @torch.no_grad()
 def run_model_forward(model, example, device):
     reset_model_memory(model)
@@ -264,6 +306,7 @@ def main():
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     model.eval().to(args.device)
+    patch_swiglu_ffn_forward_compat(model)
 
     inp = dataset.get_data_info(args.idx)
     inp_pert = perturb_input_dict_se2_oracle(dataset, inp, args.idx, args.dx, args.dy, args.dtheta)
