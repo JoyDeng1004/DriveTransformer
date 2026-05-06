@@ -18,7 +18,7 @@ import matplotlib.patches as patches
 import inspect
 import types
 
-from planner_sensitivity_report import run_basic_sensitivity_report
+from planner_sensitivity_single import run_basic_sensitivity_report
 
 # ============================================================
 # S0: Constants & Experiment Config
