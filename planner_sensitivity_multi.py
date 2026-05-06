@@ -24,7 +24,7 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 
-from planner_sensitivity_report import run_basic_sensitivity_report
+from planner_sensitivity_single import run_basic_sensitivity_report
 
 # Reuse the already-debugged single-sample experiment logic.
 from ego_ref_shift_diag import (

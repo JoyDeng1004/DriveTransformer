@@ -23,7 +23,7 @@ results = {
     ...
 }
 
-Usage: python -m planner_sensitivity_report \
+Usage: python -m planner_sensitivity_single \
   --results ./outputs/results.pkl \
   --out-dir ./outputs/planner_sensitivity_g0_g5 \
   --baseline-key G0_baseline \
