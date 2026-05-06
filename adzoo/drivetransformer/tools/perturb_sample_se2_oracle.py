@@ -22,8 +22,8 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from mmcv.parallel import collate, scatter
-from mmcv.runner import load_checkpoint
+from mmcv.parallel import collate
+from mmcv.utils import load_checkpoint
 from mmcv.utils import Config
 from mmcv.datasets import build_dataset
 from mmcv.models import build_model
@@ -107,7 +107,6 @@ def recompute_ego_fut_cmd(dataset, input_dict_pert: dict, raw_info: dict) -> Non
     input_dict_pert['_debug_command_far_local'] = np.asarray(far_xy_local).tolist()
     input_dict_pert['_debug_command_near_local'] = np.asarray(near_xy_local).tolist()
 
-
 def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int) -> None:
     cur_w2l = np.asarray(input_dict_pert['world2lidar'], dtype=np.float64)
     sample_rate = dataset.sample_interval_ego_fut
@@ -157,7 +156,6 @@ def recompute_ego_history(dataset, input_dict_pert: dict, index: int) -> None:
             offset[j] = offset[j + 1]
     input_dict_pert['ego_his_trajs'] = offset
 
-
 def perturb_input_dict_se2_oracle(dataset, input_dict: dict, index: int, dx: float, dy: float, dtheta: float):
     raw_info = dataset.get_data_by_index(index)
     pert = update_pose_fields(input_dict, dx, dy, dtheta)
@@ -166,13 +164,31 @@ def perturb_input_dict_se2_oracle(dataset, input_dict: dict, index: int, dx: flo
     recompute_ego_history(dataset, pert, index)
     return pert
 
+def _move_to_device(data, device):
+    if torch.is_tensor(data):
+        return data.to(device, non_blocking=True)
+    if isinstance(data, dict):
+        return {k: _move_to_device(v, device) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_move_to_device(v, device) for v in data]
+    if isinstance(data, tuple):
+        return tuple(_move_to_device(v, device) for v in data)
+    return data
 
+def reset_model_memory(model):
+    m = model.module if hasattr(model, "module") else model
+    if hasattr(m, "pts_bbox_head") and hasattr(m.pts_bbox_head, "reset_memory"):
+        m.pts_bbox_head.reset_memory()
+    if hasattr(m, "reset_memory"):
+        m.reset_memory()
+
+@torch.no_grad()
 def run_model_forward(model, example, device):
-    data = collate([example], samples_per_gpu=1)
-    if isinstance(device, str) and device.startswith('cuda'):
-        data = scatter(data, [device])[0]
-    return model(return_loss=False, rescale=True, **data)
+    reset_model_memory(model)
 
+    data = collate([example], samples_per_gpu=1)
+    data = _move_to_device(data, device)
+    return model(data, return_loss=False, rescale=True)
 
 def to_key_tree(obj: Any):
     if isinstance(obj, dict):
