@@ -1,3 +1,15 @@
+"""Usage:
+python /gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetransformer/tools/perturb_sample_se2_oracle.py \
+  --config /gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large.py \
+  --checkpoint /gs/bs/tga-RLA/qdeng/DriveTransformer/ckpts/drivetransformer_large.pth \
+  --idx 100 \
+  --dy 1.0 \
+  --dx 0.0 \
+  --dtheta 0.0 \
+  --out-dir outputs/se2_oracle_debug \
+  --device cuda:0
+"""
+
 import argparse
 import copy
 import importlib
