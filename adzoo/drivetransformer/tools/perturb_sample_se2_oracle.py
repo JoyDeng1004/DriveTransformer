@@ -4,7 +4,7 @@ python /gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetransformer/tools/pertur
   --checkpoint /gs/bs/tga-RLA/qdeng/DriveTransformer/ckpts/drivetransformer_large.pth \
   --idx 100 \
   --dy 0.0 \
-  --dx 1.0 \
+  --dx -1.0 \
   --dtheta 0.0 \
   --out-dir outputs/se2_oracle_debug \
   --device cuda:0
@@ -32,6 +32,12 @@ import types
 
 
 def make_se2_delta(dx: float, dy: float, dtheta: float) -> np.ndarray:
+    """
+    Return old_lidar_from_new_lidar.
+
+    In this Bench2Drive preprocessing, lidar xy is x=right, y=forward.
+    dx/dy are the new lidar origin expressed in the original lidar frame.
+    """
     c, s = np.cos(dtheta), np.sin(dtheta)
     delta = np.eye(4, dtype=np.float64)
     delta[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
@@ -68,20 +74,32 @@ def _to_np(x):
 
 def update_pose_fields(input_dict: dict, dx: float, dy: float, dtheta: float) -> dict:
     out = copy.deepcopy(input_dict)
-    T_old = np.asarray(out['ego_pose'], dtype=np.float64)
+    T_old = np.asarray(out['ego_pose'], dtype=np.float64)  # lidar_old -> world
     delta = make_se2_delta(dx, dy, dtheta)
-    T_new = T_old @ delta
-    T_new_inv = invert_pose(T_new)
+    out['_se2_delta_lidar'] = delta.astype(np.float32)
+    T_new = T_old @ delta  # lidar_new -> world
+    T_new_inv = invert_pose(T_new)  # world -> lidar_new
+
+    lidar2ego = np.eye(4, dtype=np.float64)
+    if 'sensors' in out and 'LIDAR_TOP' in out['sensors']:
+        lidar2ego = np.asarray(out['sensors']['LIDAR_TOP'].get('lidar2ego', lidar2ego), dtype=np.float64)
+    ego2world_new = T_new @ invert_pose(lidar2ego)
+    ego_translation_new = ego2world_new[:3, 3]
+    ego_yaw_new = yaw_from_rotmat(ego2world_new[:3, :3])
 
     out['ego_pose'] = T_new.astype(np.float32)
     out['ego_pose_inv'] = T_new_inv.astype(np.float32)
     out['world2lidar'] = T_new_inv.astype(np.float32)
-    out['ego_translation'] = T_new[:3, 3].astype(np.float32)
-    out['ego_yaw'] = float(yaw_from_rotmat(T_new[:3, :3]))
+    out['ego_translation'] = ego_translation_new.astype(np.float32)
+    out['ego_yaw'] = float(ego_yaw_new)
 
     if 'can_bus' in out:
         can_bus = np.asarray(out['can_bus']).copy()
         yaw = out['ego_yaw']
+        can_bus[3:7] = np.array(
+            [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)],
+            dtype=can_bus.dtype,
+        )
         if yaw < 0:
             yaw += 2 * np.pi
         can_bus[:3] = out['ego_translation']
@@ -110,7 +128,17 @@ def recompute_ego_fut_cmd(dataset, input_dict_pert: dict, raw_info: dict) -> Non
     input_dict_pert['_debug_command_near_local'] = np.asarray(near_xy_local).tolist()
 
 def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int) -> None:
-    cur_w2l = np.asarray(input_dict_pert['world2lidar'], dtype=np.float64)
+    raw_cur_frame = dataset.get_data_by_index(index)
+    raw_cur_w2l = np.asarray(raw_cur_frame['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+    delta_lidar = np.asarray(input_dict_pert['_se2_delta_lidar'], dtype=np.float64)
+
+    # Match B2D_DriveTransformer_Dataset.get_ego_future_trajs exactly:
+    # future labels are future LIDAR_TOP origins expressed in the current
+    # LIDAR_TOP frame. The raw dataset uses sensors.LIDAR_TOP.world2lidar for
+    # this label, which is not always numerically identical to ego_pose_inv.
+    # For a planner-state perturbation, current_new_from_world =
+    # new_from_old @ current_old_from_world.
+    cur_w2l = invert_pose(delta_lidar) @ raw_cur_w2l
     sample_rate = dataset.sample_interval_ego_fut
     fut_frames = dataset.future_frames_ego_fix_time
     full_adj_track = np.zeros((fut_frames, 2), dtype=np.float32)
@@ -127,9 +155,6 @@ def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int) -> N
     input_dict_pert['ego_fut_trajs_fix_time'] = full_adj_track
     input_dict_pert['ego_fut_masks_fix_time'] = full_adj_mask
     input_dict_pert['fut_valid_flag_fix_time'] = full_adj_mask[-1]
-
-    # TODO: recompute ego_fut_trajs_fix_dist with perturbed world2lidar if needed.
-
 
 def recompute_ego_history(dataset, input_dict_pert: dict, index: int) -> None:
     cur_w2l = np.asarray(input_dict_pert['world2lidar'], dtype=np.float64)
@@ -468,11 +493,9 @@ def split_traj_lat_fwd(traj: np.ndarray, order="lat_fwd"):
     """
     Split trajectory into raw lateral/forward arrays.
 
-    Empirically for DriveTransformer ego_fut_preds_fix_time on B2D:
-      traj[:, 0] behaves like lateral
-      traj[:, 1] behaves like forward
-
-    But keep this configurable via --traj-order.
+    DriveTransformer/B2D fix-time ego labels are adj2cur_lidar[:2, 3].
+    In this repo's preprocessed lidar frame, x is right and y is forward,
+    so the default order is traj[:,0]=right/lateral, traj[:,1]=forward.
     """
     traj = as_traj_np(traj, "traj_for_split")
 
@@ -492,21 +515,57 @@ def traj_to_bev_axes(traj: np.ndarray, order="lat_fwd", lateral_positive="right"
     """
     Convert trajectory to BEV display axes.
 
+    Input trajectory is in a lidar-local frame.
     Display convention:
-      horizontal axis = lateral, left-positive
+      horizontal axis = lateral, vehicle-right-positive
       vertical axis   = forward
+
+    This keeps the BEV horizontal sign aligned with the preprocessed B2D lidar
+    x axis. Camera image left/right is still perspective-dependent and should
+    not be treated as a metric BEV axis.
     """
     lat, fwd = split_traj_lat_fwd(traj, order=order)
 
-    # Convert raw lateral sign to display left-positive.
+    # Convert raw lateral sign to display vehicle-right-positive.
     if lateral_positive == "right":
-        lat = -lat
-    elif lateral_positive == "left":
         pass
+    elif lateral_positive == "left":
+        lat = -lat
     else:
         raise ValueError(lateral_positive)
 
     return lat, fwd
+
+
+def traj_pair_diff_stats(
+    ref: np.ndarray,
+    test: np.ndarray,
+    order="lat_fwd",
+    lateral_positive="right",
+) -> dict:
+    """
+    Compare trajectories in lidar xy, where x=vehicle right and y=forward.
+    """
+    ref_xy = traj_to_lidar_xy_for_projection(
+        ref,
+        order=order,
+        lateral_positive=lateral_positive,
+    )
+    test_xy = traj_to_lidar_xy_for_projection(
+        test,
+        order=order,
+        lateral_positive=lateral_positive,
+    )
+    diff = test_xy - ref_xy
+    abs_diff = np.abs(diff)
+    return {
+        'max_abs_diff_x_right_m': float(abs_diff[:, 0].max()) if len(abs_diff) else 0.0,
+        'max_abs_diff_y_forward_m': float(abs_diff[:, 1].max()) if len(abs_diff) else 0.0,
+        'mean_abs_diff_x_right_m': float(abs_diff[:, 0].mean()) if len(abs_diff) else 0.0,
+        'mean_abs_diff_y_forward_m': float(abs_diff[:, 1].mean()) if len(abs_diff) else 0.0,
+        'first_diff_xy_right_forward_m': diff[0].astype(float).tolist() if len(diff) else [],
+        'last_diff_xy_right_forward_m': diff[-1].astype(float).tolist() if len(diff) else [],
+    }
 
 
 def traj_to_lidar_xy_for_projection(
@@ -515,36 +574,66 @@ def traj_to_lidar_xy_for_projection(
     lateral_positive="right",
 ):
     """
-    Convert raw planner trajectory into the 2D coordinate expected by lidar2img.
+    Convert planner trajectory columns to this repo's lidar xy.
 
-    Important:
-    This is for camera projection, not BEV display.
-
-    For the current DriveTransformer/B2D setting, the model trajectory appears
-    to use:
-      raw dim0 = lateral
-      raw dim1 = forward
-
-    The lidar2img in this repo is built from the same dataset-local lidar frame,
-    so we keep the raw coordinate order as [dim0, dim1] when order='lat_fwd'.
-
-    If you later confirm the model output is standard MMDet3D lidar [x=front,y=left],
-    run with --traj-order fwd_lat.
+    Bench2Drive preprocessing used by DriveTransformer stores lidar xy as:
+      x = right, y = forward.
+    lidar2img is built for that same lidar frame, so BEV-only sign flips must
+    not leak into camera projection.
     """
     lat, fwd = split_traj_lat_fwd(traj, order=order)
 
-    if order == "lat_fwd":
-        # Dataset-local xy for this script: x-like dim = lateral, y-like dim = forward.
+    if lateral_positive == "right":
         x = lat
-        y = fwd
-    elif order == "fwd_lat":
-        # Standard-ish lidar xy: x = forward, y = lateral.
-        x = fwd
-        y = lat
+    elif lateral_positive == "left":
+        x = -lat
     else:
-        raise ValueError(order)
+        raise ValueError(lateral_positive)
+    y = fwd
 
     return np.stack([x, y], axis=1).astype(np.float32)
+
+
+def transform_traj_lidar_frame(
+    traj: np.ndarray,
+    dst_from_src: np.ndarray,
+    order="lat_fwd",
+    lateral_positive="right",
+):
+    """
+    Transform a 2D trajectory from one lidar frame to another.
+
+    The returned trajectory uses the same column convention as the input.
+    This is used to compare original and perturbed predictions in one BEV
+    frame without reinterpreting the model output.
+    """
+    xy_src = traj_to_lidar_xy_for_projection(
+        traj,
+        order=order,
+        lateral_positive=lateral_positive,
+    )
+    n = xy_src.shape[0]
+    pts_src = np.concatenate(
+        [
+            xy_src,
+            np.zeros((n, 1), dtype=np.float32),
+            np.ones((n, 1), dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float64)
+    xy_dst = (dst_from_src @ pts_src.T).T[:, :2].astype(np.float32)
+    if lateral_positive == "right":
+        lat_dst = xy_dst[:, 0]
+    elif lateral_positive == "left":
+        lat_dst = -xy_dst[:, 0]
+    else:
+        raise ValueError(lateral_positive)
+    fwd_dst = xy_dst[:, 1]
+    if order == "lat_fwd":
+        return np.stack([lat_dst, fwd_dst], axis=1).astype(np.float32)
+    if order == "fwd_lat":
+        return np.stack([fwd_dst, lat_dst], axis=1).astype(np.float32)
+    raise ValueError(order)
 
 
 def make_traj_xyz1_for_projection(
@@ -554,7 +643,10 @@ def make_traj_xyz1_for_projection(
     lateral_positive="right",
 ):
     """
-    Build homogeneous trajectory points for lidar2img projection.
+    Build homogeneous points in the lidar frame consumed by lidar2img.
+
+    z is lidar z. The default -1.8 m places the polyline near the road plane
+    below the roof-mounted lidar; tune --traj-z if the sensor height differs.
     """
     xy = traj_to_lidar_xy_for_projection(
         traj,
@@ -648,9 +740,12 @@ def main():
     ap.add_argument('--config', required=True)
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--idx', type=int, required=True)
-    ap.add_argument('--dx', type=float, default=0.0)
-    ap.add_argument('--dy', type=float, default=0.0)
-    ap.add_argument('--dtheta', type=float, default=0.0)
+    ap.add_argument('--dx', type=float, default=0.0,
+                    help='New lidar origin x in original lidar frame; B2D lidar x is right.')
+    ap.add_argument('--dy', type=float, default=0.0,
+                    help='New lidar origin y in original lidar frame; B2D lidar y is forward.')
+    ap.add_argument('--dtheta', type=float, default=0.0,
+                    help='Yaw of new lidar frame relative to original lidar frame, radians.')
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--camera', default='CAM_FRONT')
@@ -667,7 +762,7 @@ def main():
         default='lat_fwd',
         choices=['lat_fwd', 'fwd_lat'],
         help='How to interpret trajectory columns for visualization. '
-             'lat_fwd means traj[:,0]=lateral, traj[:,1]=forward.'
+             'Default B2D convention: lat_fwd means traj[:,0]=right/lateral, traj[:,1]=forward.'
     )
     ap.add_argument(
         '--lateral-positive',
@@ -716,53 +811,141 @@ def main():
     save_csv(osp.join(args.out_dir, 'traj_original_gt.csv'), gt)
     save_csv(osp.join(args.out_dir, 'traj_perturbed_gt.csv'), gt_p)
 
-    # bev view
-    pred_lat, pred_fwd = traj_to_bev_axes(
+    # Same delta convention as update_pose_fields:
+    #   lidar2world_new = lidar2world_old @ old_lidar_from_new_lidar
+    # Therefore a point in the perturbed/new lidar frame maps to the original
+    # lidar frame as p_old = old_lidar_from_new_lidar @ p_new.
+    delta_lidar = make_se2_delta(args.dx, args.dy, args.dtheta)
+
+    pred_p_old = transform_traj_lidar_frame(
+        pred_p,
+        delta_lidar,
+        order=args.traj_order,
+        lateral_positive=args.lateral_positive,
+    )
+    gt_p_old = transform_traj_lidar_frame(
+        gt_p,
+        delta_lidar,
+        order=args.traj_order,
+        lateral_positive=args.lateral_positive,
+    )
+    save_csv(osp.join(args.out_dir, 'traj_perturbed_pred_in_original_lidar.csv'), pred_p_old)
+    save_csv(osp.join(args.out_dir, 'traj_perturbed_gt_in_original_lidar.csv'), gt_p_old)
+
+    raw_info_for_audit = dataset.get_data_by_index(args.idx)
+    lidar2ego = np.asarray(raw_info_for_audit['sensors']['LIDAR_TOP']['lidar2ego'], dtype=np.float64)
+    ego2lidar = invert_pose(lidar2ego)
+    sensor_w2l = np.asarray(inp_raw_for_vis['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+    top_w2l = np.asarray(inp_raw_for_vis['world2lidar'], dtype=np.float64)
+    pose_w2l = np.asarray(inp_raw_for_vis['ego_pose_inv'], dtype=np.float64)
+    pose_lidar_origin_in_sensor_lidar = (
+        sensor_w2l @ invert_pose(pose_w2l) @ np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    )[:3]
+    sensor_lidar_origin_in_pose_lidar = (
+        pose_w2l @ invert_pose(sensor_w2l) @ np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    )[:3]
+    label_origin_debug = {
+        'dataset_fix_time_label_source': 'sensors.LIDAR_TOP.world2lidar; future LIDAR_TOP origin in current LIDAR_TOP frame',
+        'lidar2ego_translation_xyz': lidar2ego[:3, 3].astype(float).tolist(),
+        'ego_origin_in_lidar_xyz': ego2lidar[:3, 3].astype(float).tolist(),
+        'top_world2lidar_vs_sensor_world2lidar_max_abs': float(np.abs(top_w2l - sensor_w2l).max()),
+        'ego_pose_inv_vs_sensor_world2lidar_max_abs': float(np.abs(pose_w2l - sensor_w2l).max()),
+        'pose_lidar_origin_in_sensor_lidar_xyz': pose_lidar_origin_in_sensor_lidar.astype(float).tolist(),
+        'sensor_lidar_origin_in_pose_lidar_xyz': sensor_lidar_origin_in_pose_lidar.astype(float).tolist(),
+    }
+
+    traj_sanity = {
+        'frame': 'original_lidar',
+        'axis_convention': 'x=vehicle_right, y=forward',
+        'label_origin_debug': label_origin_debug,
+        'gt_p_old_minus_gt_orig': traj_pair_diff_stats(
+            gt,
+            gt_p_old,
+            order=args.traj_order,
+            lateral_positive=args.lateral_positive,
+        ),
+        'pred_p_old_minus_pred_orig': traj_pair_diff_stats(
+            pred,
+            pred_p_old,
+            order=args.traj_order,
+            lateral_positive=args.lateral_positive,
+        ),
+    }
+    debug_json_path = osp.join(args.out_dir, 'trajectory_frame_sanity.json')
+    with open(debug_json_path, 'w') as f:
+        json.dump(traj_sanity, f, indent=2)
+    print(f"[sanity] saved trajectory frame sanity: {debug_json_path}")
+    print("[sanity] label origin debug:", json.dumps(label_origin_debug, indent=2))
+    print("[sanity] gt_p_old - gt_orig:", json.dumps(traj_sanity['gt_p_old_minus_gt_orig'], indent=2))
+    print("[sanity] pred_p_old - pred_orig:", json.dumps(traj_sanity['pred_p_old_minus_pred_orig'], indent=2))
+
+    # BEV comparison is drawn in the original lidar frame. The perturbed GT can
+    # nearly overlap the original GT after this frame conversion; that means the
+    # perturbation/reprojection is geometrically self-consistent, not inactive.
+    pred_right, pred_fwd = traj_to_bev_axes(
         pred, order=args.traj_order, lateral_positive=args.lateral_positive
     )
-    predp_lat, predp_fwd = traj_to_bev_axes(
-        pred_p, order=args.traj_order, lateral_positive=args.lateral_positive
+    predp_right, predp_fwd = traj_to_bev_axes(
+        pred_p_old, order=args.traj_order, lateral_positive=args.lateral_positive
     )
-    gt_lat, gt_fwd = traj_to_bev_axes(
+    gt_right, gt_fwd = traj_to_bev_axes(
         gt, order=args.traj_order, lateral_positive=args.lateral_positive
     )
-    gtp_lat, gtp_fwd = traj_to_bev_axes(
-        gt_p, order=args.traj_order, lateral_positive=args.lateral_positive
+    gtp_right, gtp_fwd = traj_to_bev_axes(
+        gt_p_old, order=args.traj_order, lateral_positive=args.lateral_positive
     )
 
-    plt.figure(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(7.2, 8.2), constrained_layout=True)
+    colors = {
+        'pred_orig': '#2563eb',
+        'pred_pert': '#dc2626',
+        'gt_orig': '#15803d',
+        'gt_pert': '#f59e0b',
+    }
+    ax.plot(pred_right, pred_fwd, '-o', label='pred_orig', color=colors['pred_orig'],
+            linewidth=2.3, markersize=4.5, zorder=4)
+    ax.plot(predp_right, predp_fwd, '-o', label='pred_pert -> original frame',
+            color=colors['pred_pert'], linewidth=2.3, markersize=4.5, zorder=5)
+    ax.plot(gt_right, gt_fwd, '--', label='gt_orig', color=colors['gt_orig'],
+            linewidth=2.1, alpha=0.9, zorder=2)
+    ax.plot(gtp_right, gtp_fwd, ':', label='gt_pert -> original frame',
+            color=colors['gt_pert'], linewidth=2.8, alpha=0.95, zorder=3)
 
-    plt.plot(pred_lat, pred_fwd, '-o', label='pred_orig', linewidth=2, markersize=5)
-    plt.plot(predp_lat, predp_fwd, '-o', label='pred_pert', linewidth=2, markersize=5)
-    plt.plot(gt_lat, gt_fwd, '--', label='gt_orig', linewidth=2)
-    plt.plot(gtp_lat, gtp_fwd, '--', label='gt_pert', linewidth=2)
+    ax.scatter([0], [0], c='k', marker='x', s=80, label='ego_origin', zorder=6)
+    ax.annotate('right +', xy=(3.0, -2.3), xytext=(0.4, -2.3),
+                arrowprops=dict(arrowstyle='->', color='0.25', lw=1.4),
+                fontsize=9, color='0.25', va='center')
+    ax.annotate('forward +', xy=(-8.6, 5.2), xytext=(-8.6, 0.6),
+                arrowprops=dict(arrowstyle='->', color='0.25', lw=1.4),
+                fontsize=9, color='0.25', ha='center')
 
-    plt.scatter([0], [0], c='k', marker='x', s=80, label='ego_origin')
+    if len(pred_right):
+        ax.text(pred_right[0], pred_fwd[0], 'orig start', fontsize=8, color=colors['pred_orig'])
+        ax.text(pred_right[-1], pred_fwd[-1], 'orig end', fontsize=8, color=colors['pred_orig'])
+    if len(predp_right):
+        ax.text(predp_right[0], predp_fwd[0], 'pert start', fontsize=8, color=colors['pred_pert'])
+        ax.text(predp_right[-1], predp_fwd[-1], 'pert end', fontsize=8, color=colors['pred_pert'])
 
-    for i in range(len(pred_lat)):
-        plt.text(pred_lat[i], pred_fwd[i], f"o{i}", fontsize=8)
-    for i in range(len(predp_lat)):
-        plt.text(predp_lat[i], predp_fwd[i], f"p{i}", fontsize=8)
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, color='0.88', linewidth=0.8)
+    ax.legend(loc='upper left', frameon=True, framealpha=0.95)
+    ax.set_xlabel("vehicle lateral / m (right +)")
+    ax.set_ylabel("forward / m")
 
-    plt.axis('equal')
-    plt.grid(True)
-    plt.legend()
-    plt.xlabel("lateral / m (left +)")
-    plt.ylabel("forward / m")
-
-    # Set a stable view range for planning.
-    # Lateral range is narrow; forward range is long.
-    plt.xlim(-10, 10)
-    plt.ylim(-5, 35)
-
-    plt.title(
-        f'idx={args.idx} dx={args.dx} dy={args.dy} dtheta={args.dtheta}\n'
-        f'key={dbg.get("source_key", "na")} '
-        f'order={args.traj_order} lat_positive={args.lateral_positive}\n'
-        f'image unchanged=True'
+    # Stable planning view. BEV is metric; camera image left/right is perspective
+    # projection and should not be compared to this axis as a literal coordinate.
+    ax.set_xlim(-10, 10)
+    ax.set_ylim(-5, 35)
+    ax.set_title(
+        f'Unified BEV in original lidar frame | idx={args.idx}, dx={args.dx}, dy={args.dy}, dtheta={args.dtheta}\n'
+        f'perturbed trajectories are mapped back before plotting; image/lidar2img unchanged',
+        fontsize=11,
     )
-    plt.savefig(osp.join(args.out_dir, 'fig_bev_original_vs_perturbed.png'), dpi=180)
-    plt.close()
+
+    bev_jpg_path = osp.join(args.out_dir, 'fig_bev_original_vs_perturbed.jpg')
+    fig.savefig(bev_jpg_path, dpi=220)
+    plt.close(fig)
+    print(f"[save] BEV visualization: {bev_jpg_path}")
 
     # camera view
     vis_inp = inp_raw_for_vis
@@ -777,13 +960,6 @@ def main():
     lidar2img_all = unwrap_data(vis_inp['lidar2img'])
     lidar2img_all = np.asarray(lidar2img_all, dtype=np.float64)
 
-    # Same delta convention as update_pose_fields:
-    #   T_new = T_old @ delta
-    # Therefore a point in the perturbed/new lidar frame can be mapped to the
-    # original/old lidar frame by:
-    #   p_old = delta @ p_new
-    delta_lidar = make_se2_delta(args.dx, args.dy, args.dtheta)
-
     proj_debug = {}
 
     for cam in cam_names:
@@ -797,7 +973,7 @@ def main():
         cam_idx = cam_order.index(cam)
         lidar2img = np.asarray(lidar2img_all[cam_idx], dtype=np.float64)
 
-        # Original prediction is in original lidar frame.
+        # Original image/lidar2img are unchanged, so project in original lidar.
         pts_orig = make_traj_xyz1_for_projection(
             pred,
             z=args.traj_z,
@@ -805,8 +981,8 @@ def main():
             lateral_positive=args.lateral_positive,
         )
 
-        # Perturbed prediction is in perturbed lidar frame.
-        # Convert it back to original lidar frame before projecting to original image.
+        # The perturbed prediction is produced in the perturbed lidar frame.
+        # Convert it back to original lidar before using the original lidar2img.
         pts_pert_new = make_traj_xyz1_for_projection(
             pred_p,
             z=args.traj_z,
@@ -878,7 +1054,6 @@ def main():
         np.asarray(inp_pert_raw_for_vis['world2lidar'], dtype=np.float64)
         @ np.array([*inp_raw_for_vis['ego_translation'][:3], 1.0], dtype=np.float64)
     )[:3]
-    raw_info_for_audit = dataset.get_data_by_index(args.idx)
     
     audit = {
         'idx': args.idx,
@@ -887,8 +1062,10 @@ def main():
         'dtheta': args.dtheta,
         'experiment_type': 'planner_state_oracle_no_rerender',
         'image_rerendered': False,
-        'updated_fields': ['ego_pose', 'ego_pose_inv', 'world2lidar', 'ego_translation', 'ego_yaw', 'can_bus', 'sensors.LIDAR_TOP.world2lidar', 'ego_fut_cmd', 'ego_fut_trajs_fix_time', 'ego_his_trajs'],
-        'unchanged_fields': ['img', 'img_filename', 'cam_intrinsic', 'lidar2img'],
+        'delta_semantics': 'old_lidar_from_new_lidar; dx/dy are new lidar origin in original lidar axes (x right, y forward)',
+        'updated_fields': ['ego_pose', 'ego_pose_inv', 'world2lidar', 'ego_translation', 'ego_yaw', 'can_bus', 'sensors.LIDAR_TOP.world2lidar', 'ego_fut_cmd', 'ego_fut_trajs_fix_time', 'ego_fut_masks_fix_time', 'fut_valid_flag_fix_time', 'ego_his_trajs'],
+        'unchanged_fields': ['img', 'img_filename', 'cam_intrinsic', 'lidar2img', 'camera extrinsics', 'agent/map labels', 'ego_fut_trajs_fix_dist'],
+        'label_origin_debug': label_origin_debug,
         'old_ego_origin_in_new_lidar': old_origin_new.tolist(),
         'command_far_local_before': dataset.get_command_xy_in_local(
             raw_info_for_audit['command_far_xy'],
@@ -910,11 +1087,15 @@ def main():
         'visualization_coord_convention': {
             'traj_order': args.traj_order,
             'lateral_positive_raw': args.lateral_positive,
-            'bev_x_axis': 'lateral_left_positive',
+            'lidar_xy': 'x_right_y_forward',
+            'bev_frame': 'original_lidar',
+            'bev_x_axis': 'vehicle_right_positive',
             'bev_y_axis': 'forward',
+            'bev_note': 'metric BEV right-positive is aligned with lidar x; camera image left/right is perspective-projected pixels, not a BEV coordinate axis',
             'camera_projection_z': args.traj_z,
             'camera_perturbed_projection': 'perturbed traj converted by p_old = delta_lidar @ p_new before original lidar2img',
         },
+        'trajectory_frame_sanity': traj_sanity,
         'sanity_checks': {
             'L0_pose_inv_err': float(
                 np.abs(
@@ -924,12 +1105,13 @@ def main():
                 ).max()
             ),
             'L1_gt_diff_norm': float(np.linalg.norm(gt_p - gt, axis=-1).mean()),
-            'L2_pred_mean_display_lat_diff': float((predp_lat - pred_lat).mean()),
-            'L2_pred_first_display_lat_diff': float(predp_lat[0] - pred_lat[0]),
-            'L2_pred_final_display_lat_diff': float(predp_lat[-1] - pred_lat[-1]),
+            'L1_gt_old_frame_diff_norm': float(np.linalg.norm(gt_p_old - gt, axis=-1).mean()),
+            'L2_pred_mean_display_right_diff': float((predp_right - pred_right).mean()),
+            'L2_pred_first_display_right_diff': float(predp_right[0] - pred_right[0]),
+            'L2_pred_final_display_right_diff': float(predp_right[-1] - pred_right[-1]),
             'L2_pred_mean_forward_diff': float((predp_fwd - pred_fwd).mean()),
         },
-        'warnings': ['TODO: ego_fut_trajs_fix_dist is not recomputed in v1.'],
+        'warnings': ['ego_fut_trajs_fix_dist is not recomputed; this is acceptable for inference-only forward unless later loss/eval code consumes that label.'],
     }
     with open(osp.join(args.out_dir, 'audit.json'), 'w') as f:
         json.dump(audit, f, indent=2)
