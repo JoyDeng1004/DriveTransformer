@@ -6,7 +6,8 @@ python /gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetransformer/tools/pertur
   --dy 0.0 \
   --dx -1.0 \
   --dtheta 0.0 \
-  --out-dir outputs/se2_oracle_debug \
+  --perturb-channels label \
+  --out-dir outputs/se2_oracle_ablation/neg_round3 \
   --device cuda:0
 """
 
@@ -29,6 +30,20 @@ from mmcv.utils import Config
 from mmcv.datasets import build_dataset
 from mmcv.models import build_model
 import types
+
+from adzoo.drivetransformer.utils.recovery_augment import RecoveryRefBuilder
+
+PERTURB_CHANNEL_CHOICES = (
+    'none',
+    'history',
+    'cmd',
+    'pose_frame',
+    'can_bus',
+    'label',
+    'full',
+)
+
+ABLATION_GROUPS = ('pose_frame', 'can_bus', 'ego_fut_cmd', 'future_label', 'ego_his_trajs')
 
 
 def make_se2_delta(dx: float, dy: float, dtheta: float) -> np.ndarray:
@@ -72,51 +87,79 @@ def _to_np(x):
     return np.asarray(x)
 
 
-def update_pose_fields(input_dict: dict, dx: float, dy: float, dtheta: float) -> dict:
-    out = copy.deepcopy(input_dict)
-    T_old = np.asarray(out['ego_pose'], dtype=np.float64)  # lidar_old -> world
+def compute_pose_frame_patch(input_dict: dict, dx: float, dy: float, dtheta: float) -> dict:
+    T_old = np.asarray(input_dict['ego_pose'], dtype=np.float64)  # lidar_old -> world
     delta = make_se2_delta(dx, dy, dtheta)
-    out['_se2_delta_lidar'] = delta.astype(np.float32)
     T_new = T_old @ delta  # lidar_new -> world
     T_new_inv = invert_pose(T_new)  # world -> lidar_new
 
     lidar2ego = np.eye(4, dtype=np.float64)
-    if 'sensors' in out and 'LIDAR_TOP' in out['sensors']:
-        lidar2ego = np.asarray(out['sensors']['LIDAR_TOP'].get('lidar2ego', lidar2ego), dtype=np.float64)
+    if 'sensors' in input_dict and 'LIDAR_TOP' in input_dict['sensors']:
+        lidar2ego = np.asarray(input_dict['sensors']['LIDAR_TOP'].get('lidar2ego', lidar2ego), dtype=np.float64)
     ego2world_new = T_new @ invert_pose(lidar2ego)
     ego_translation_new = ego2world_new[:3, 3]
     ego_yaw_new = yaw_from_rotmat(ego2world_new[:3, :3])
 
-    out['ego_pose'] = T_new.astype(np.float32)
-    out['ego_pose_inv'] = T_new_inv.astype(np.float32)
-    out['world2lidar'] = T_new_inv.astype(np.float32)
-    out['ego_translation'] = ego_translation_new.astype(np.float32)
-    out['ego_yaw'] = float(ego_yaw_new)
+    return {
+        'delta_lidar': delta.astype(np.float32),
+        'ego_pose': T_new.astype(np.float32),
+        'ego_pose_inv': T_new_inv.astype(np.float32),
+        'world2lidar': T_new_inv.astype(np.float32),
+        'ego_translation': ego_translation_new.astype(np.float32),
+        'ego_yaw': float(ego_yaw_new),
+    }
 
-    if 'can_bus' in out:
-        can_bus = np.asarray(out['can_bus']).copy()
-        yaw = out['ego_yaw']
-        can_bus[3:7] = np.array(
-            [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)],
-            dtype=can_bus.dtype,
-        )
-        if yaw < 0:
-            yaw += 2 * np.pi
-        can_bus[:3] = out['ego_translation']
-        can_bus[16] = yaw
-        can_bus[17] = yaw / np.pi * 180.0
-        out['can_bus'] = can_bus.astype(np.float32)
 
-    if 'sensors' in out and 'LIDAR_TOP' in out['sensors']:
-        out['sensors']['LIDAR_TOP']['world2lidar'] = T_new_inv.astype(np.float32)
+def patch_pose_frame(input_dict_pert: dict, pose_patch: dict) -> List[str]:
+    input_dict_pert['_se2_delta_lidar'] = pose_patch['delta_lidar']
+    input_dict_pert['ego_pose'] = pose_patch['ego_pose']
+    input_dict_pert['ego_pose_inv'] = pose_patch['ego_pose_inv']
+    input_dict_pert['world2lidar'] = pose_patch['world2lidar']
+    input_dict_pert['ego_translation'] = pose_patch['ego_translation']
+    input_dict_pert['ego_yaw'] = pose_patch['ego_yaw']
+
+    patched = ['ego_pose', 'ego_pose_inv', 'world2lidar', 'ego_translation', 'ego_yaw']
+    if 'sensors' in input_dict_pert and 'LIDAR_TOP' in input_dict_pert['sensors']:
+        input_dict_pert['sensors']['LIDAR_TOP']['world2lidar'] = pose_patch['world2lidar']
+        patched.append("sensors['LIDAR_TOP']['world2lidar']")
+    return patched
+
+
+def patch_can_bus(input_dict_pert: dict, pose_patch: dict) -> List[str]:
+    if 'can_bus' not in input_dict_pert:
+        return []
+
+    can_bus = np.asarray(input_dict_pert['can_bus']).copy()
+    yaw = float(pose_patch['ego_yaw'])
+    can_bus[3:7] = np.array(
+        [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)],
+        dtype=can_bus.dtype,
+    )
+    if yaw < 0:
+        yaw += 2 * np.pi
+    can_bus[:3] = np.asarray(pose_patch['ego_translation'])[:3]
+    can_bus[16] = yaw
+    can_bus[17] = yaw / np.pi * 180.0
+    input_dict_pert['can_bus'] = can_bus.astype(np.float32)
+    return ['can_bus']
+
+
+def update_pose_fields(input_dict: dict, dx: float, dy: float, dtheta: float) -> dict:
+    out = copy.deepcopy(input_dict)
+    pose_patch = compute_pose_frame_patch(input_dict, dx, dy, dtheta)
+    patch_pose_frame(out, pose_patch)
 
     return out
 
 
-def recompute_ego_fut_cmd(dataset, input_dict_pert: dict, raw_info: dict) -> None:
+def recompute_ego_fut_cmd(dataset, input_dict_pert: dict, raw_info: dict, ego_xy=None, yaw=None) -> None:
     cmd = np.zeros(140, dtype=np.float32)
-    yaw = float(input_dict_pert['ego_yaw'])
-    ego_xy = np.asarray(input_dict_pert['ego_translation'][:2], dtype=np.float32)
+    if yaw is None:
+        yaw = float(input_dict_pert['ego_yaw'])
+    if ego_xy is None:
+        ego_xy = np.asarray(input_dict_pert['ego_translation'][:2], dtype=np.float32)
+    else:
+        ego_xy = np.asarray(ego_xy, dtype=np.float32)
     far_xy_local = dataset.get_command_xy_in_local(raw_info['command_far_xy'], ego_xy, yaw)
     near_xy_local = dataset.get_command_xy_in_local(raw_info['command_near_xy'], ego_xy, yaw)
     cmd[0:6] = dataset.command2hot(raw_info['command_far'])
@@ -127,10 +170,78 @@ def recompute_ego_fut_cmd(dataset, input_dict_pert: dict, raw_info: dict) -> Non
     input_dict_pert['_debug_command_far_local'] = np.asarray(far_xy_local).tolist()
     input_dict_pert['_debug_command_near_local'] = np.asarray(near_xy_local).tolist()
 
-def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int) -> None:
+def patch_route_command(dataset, input_dict_pert: dict, raw_info: dict, pose_patch: dict) -> List[str]:
+    recompute_ego_fut_cmd(
+        dataset,
+        input_dict_pert,
+        raw_info,
+        ego_xy=np.asarray(pose_patch['ego_translation'])[:2],
+        yaw=float(pose_patch['ego_yaw']),
+    )
+    return ['ego_fut_cmd']
+
+
+def patch_recovery_ref_command(
+    input_dict_old: dict,
+    input_dict_pert: dict,
+    pose_patch: dict,
+    near_idx: int,
+    far_idx: int,
+    dx: float,
+    dy: float,
+    dtheta: float,
+) -> List[str]:
+    builder = RecoveryRefBuilder(near_idx=near_idx, far_idx=far_idx)
+    recovery = builder.build(
+        future_old_xy=np.asarray(input_dict_old['ego_fut_trajs_fix_time'], dtype=np.float64),
+        T_old_lidar_to_world=np.asarray(input_dict_old['ego_pose'], dtype=np.float64),
+        T_new_lidar_to_world=np.asarray(pose_patch['ego_pose'], dtype=np.float64),
+    )
+    input_dict_pert['ego_fut_cmd'] = recovery['ego_fut_cmd_new'].astype(np.float32)
+
+    debug_info = dict(recovery['debug_info'])
+    debug_info.update(
+        {
+            'cmd_source': 'recovery_ref',
+            'dx': float(dx),
+            'dy': float(dy),
+            'dtheta': float(dtheta),
+            'expected_sign_check': {
+                'near_ref_new_x': float(recovery['near_ref_new'][0]),
+                'expected_approximately_minus_dx': float(-dx),
+                'near_ref_new_x_plus_dx': float(recovery['near_ref_new'][0] + dx),
+            },
+        }
+    )
+    input_dict_pert['_debug_recovery_ref'] = debug_info
+    input_dict_pert['_debug_recovery_near_ref_new'] = recovery['near_ref_new'].astype(float).tolist()
+    input_dict_pert['_debug_recovery_far_ref_new'] = recovery['far_ref_new'].astype(float).tolist()
+
+    print(
+        f"[recovery_ref] dx={dx:.6f}, dy={dy:.6f}, dtheta={dtheta:.6f}, "
+        f"near_ref_new={input_dict_pert['_debug_recovery_near_ref_new']}, "
+        f"far_ref_new={input_dict_pert['_debug_recovery_far_ref_new']}"
+    )
+    print(
+        "[recovery_ref] identity mean/max diff: "
+        f"{debug_info.get('identity_mean_point_error', 0.0):.9f}/"
+        f"{debug_info.get('identity_max_point_error', 0.0):.9f}"
+    )
+    print(
+        "[recovery_ref] expected sign check: "
+        f"near_ref_new.x={float(recovery['near_ref_new'][0]):.6f}, "
+        f"-dx={-dx:.6f}, x+dx={float(recovery['near_ref_new'][0] + dx):.6f}"
+    )
+
+    return ['ego_fut_cmd']
+
+
+def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int, delta_lidar=None) -> None:
     raw_cur_frame = dataset.get_data_by_index(index)
     raw_cur_w2l = np.asarray(raw_cur_frame['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
-    delta_lidar = np.asarray(input_dict_pert['_se2_delta_lidar'], dtype=np.float64)
+    if delta_lidar is None:
+        delta_lidar = input_dict_pert['_se2_delta_lidar']
+    delta_lidar = np.asarray(delta_lidar, dtype=np.float64)
 
     # Match B2D_DriveTransformer_Dataset.get_ego_future_trajs exactly:
     # future labels are future LIDAR_TOP origins expressed in the current
@@ -156,8 +267,16 @@ def recompute_ego_future_labels(dataset, input_dict_pert: dict, index: int) -> N
     input_dict_pert['ego_fut_masks_fix_time'] = full_adj_mask
     input_dict_pert['fut_valid_flag_fix_time'] = full_adj_mask[-1]
 
-def recompute_ego_history(dataset, input_dict_pert: dict, index: int) -> None:
-    cur_w2l = np.asarray(input_dict_pert['world2lidar'], dtype=np.float64)
+def patch_future_label(dataset, input_dict_pert: dict, index: int, pose_patch: dict) -> List[str]:
+    input_dict_pert['_se2_delta_lidar'] = pose_patch['delta_lidar']
+    recompute_ego_future_labels(dataset, input_dict_pert, index, delta_lidar=pose_patch['delta_lidar'])
+    return ['ego_fut_trajs_fix_time', 'ego_fut_masks_fix_time', 'fut_valid_flag_fix_time']
+
+
+def recompute_ego_history(dataset, input_dict_pert: dict, index: int, cur_w2l=None) -> None:
+    if cur_w2l is None:
+        cur_w2l = input_dict_pert['world2lidar']
+    cur_w2l = np.asarray(cur_w2l, dtype=np.float64)
     sample_rate = dataset.sample_interval
     past_frames = dataset.past_frames
     full_track = np.zeros((past_frames + 1, 2), dtype=np.float32)
@@ -183,9 +302,103 @@ def recompute_ego_history(dataset, input_dict_pert: dict, index: int) -> None:
             offset[j] = offset[j + 1]
     input_dict_pert['ego_his_trajs'] = offset
 
+
+def patch_history(dataset, input_dict_pert: dict, index: int, pose_patch: dict) -> List[str]:
+    recompute_ego_history(dataset, input_dict_pert, index, cur_w2l=pose_patch['world2lidar'])
+    return ['ego_his_trajs']
+
+
+def _groups_for_perturb_channel(perturb_channels: str) -> List[str]:
+    if perturb_channels == 'none':
+        return []
+    if perturb_channels == 'history':
+        return ['ego_his_trajs']
+    if perturb_channels == 'cmd':
+        return ['ego_fut_cmd']
+    if perturb_channels == 'pose_frame':
+        return ['pose_frame']
+    if perturb_channels == 'can_bus':
+        return ['can_bus']
+    if perturb_channels == 'label':
+        return ['future_label']
+    if perturb_channels == 'full':
+        return ['pose_frame', 'can_bus', 'ego_fut_cmd', 'future_label', 'ego_his_trajs']
+    raise ValueError(f"Unsupported perturb_channels={perturb_channels}")
+
+
+def apply_perturbation_by_channels(
+    dataset,
+    input_dict: dict,
+    index: int,
+    dx: float,
+    dy: float,
+    dtheta: float,
+    perturb_channels: str,
+    cmd_source: str = 'route_command',
+    recovery_near_idx: int = 1,
+    recovery_far_idx: int = -1,
+):
+    raw_info = dataset.get_data_by_index(index)
+    pert = copy.deepcopy(input_dict)
+    pose_patch = compute_pose_frame_patch(input_dict, dx, dy, dtheta)
+    groups = _groups_for_perturb_channel(perturb_channels)
+    patched_fields = []
+
+    if 'pose_frame' in groups:
+        patched_fields.extend(patch_pose_frame(pert, pose_patch))
+    if 'can_bus' in groups:
+        patched_fields.extend(patch_can_bus(pert, pose_patch))
+    if 'ego_fut_cmd' in groups:
+        if cmd_source == 'route_command':
+            patched_fields.extend(patch_route_command(dataset, pert, raw_info, pose_patch))
+        elif cmd_source == 'recovery_ref':
+            patched_fields.extend(
+                patch_recovery_ref_command(
+                    input_dict,
+                    pert,
+                    pose_patch,
+                    near_idx=recovery_near_idx,
+                    far_idx=recovery_far_idx,
+                    dx=dx,
+                    dy=dy,
+                    dtheta=dtheta,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported cmd_source={cmd_source}")
+    if 'future_label' in groups:
+        patched_fields.extend(patch_future_label(dataset, pert, index, pose_patch))
+    if 'ego_his_trajs' in groups:
+        patched_fields.extend(patch_history(dataset, pert, index, pose_patch))
+
+    not_patched = [g for g in ABLATION_GROUPS if g not in groups]
+    print(f"[ablation] perturb_channels = {perturb_channels}")
+    print(f"[ablation] patched: {', '.join(patched_fields) if patched_fields else 'none'}")
+    print(f"[ablation] not patched: {', '.join(not_patched) if not_patched else 'none'}")
+
+    info = {
+        'perturb_channels': perturb_channels,
+        'patched_groups': groups,
+        'not_patched_groups': not_patched,
+        'patched_fields': patched_fields,
+        'pose_frame_patched': 'pose_frame' in groups,
+        'future_label_patched': 'future_label' in groups,
+        'cmd_source': cmd_source,
+        'recovery_ref_debug': pert.get('_debug_recovery_ref', {}),
+    }
+    return pert, info
+
+
 def perturb_input_dict_se2_oracle(dataset, input_dict: dict, index: int, dx: float, dy: float, dtheta: float):
     raw_info = dataset.get_data_by_index(index)
     pert = update_pose_fields(input_dict, dx, dy, dtheta)
+    pose_patch = {
+        'delta_lidar': pert['_se2_delta_lidar'],
+        'world2lidar': pert['world2lidar'],
+        'ego_translation': pert['ego_translation'],
+        'ego_yaw': pert['ego_yaw'],
+    }
+    patch_can_bus(pert, pose_patch)
     recompute_ego_fut_cmd(dataset, pert, raw_info)
     recompute_ego_future_labels(dataset, pert, index)
     recompute_ego_history(dataset, pert, index)
@@ -214,6 +427,15 @@ def _move_to_device(data, device):
 
 def reset_model_memory(model):
     m = model.module if hasattr(model, "module") else model
+    # DriveTransformer.forward_test uses prev_scene_token to decide whether
+    # prev_exists=0 or 1. Resetting only pts_bbox_head memory is not enough:
+    # the second forward of the same sample would otherwise enter the temporal
+    # path as if it had a previous frame, producing false ablation differences
+    # even for --perturb-channels none/label.
+    if hasattr(m, "prev_scene_token"):
+        m.prev_scene_token = None
+    if hasattr(m, "test_flag"):
+        m.test_flag = False
     if hasattr(m, "pts_bbox_head") and hasattr(m.pts_bbox_head, "reset_memory"):
         m.pts_bbox_head.reset_memory()
     if hasattr(m, "reset_memory"):
@@ -443,6 +665,9 @@ def extract_ego_pred_traj(outputs, score_mode="argmax") -> Tuple[np.ndarray, dic
 def save_csv(path, arr):
     np.savetxt(path, arr, delimiter=',', fmt='%.6f')
 
+def fmt_num_for_filename(x) -> str:
+    return str(x).replace('/', '_')
+
 def unwrap_data(obj):
     """
     Recursively unwrap mmcv DataContainer / single-item wrappers.
@@ -556,15 +781,25 @@ def traj_pair_diff_stats(
         order=order,
         lateral_positive=lateral_positive,
     )
+    n = min(len(ref_xy), len(test_xy))
+    ref_xy = ref_xy[:n]
+    test_xy = test_xy[:n]
     diff = test_xy - ref_xy
     abs_diff = np.abs(diff)
+    point_error = np.linalg.norm(diff, axis=1) if len(diff) else np.zeros((0,), dtype=np.float32)
+    mid_idx = len(diff) // 2 if len(diff) else None
     return {
+        'num_points_compared': int(n),
         'max_abs_diff_x_right_m': float(abs_diff[:, 0].max()) if len(abs_diff) else 0.0,
         'max_abs_diff_y_forward_m': float(abs_diff[:, 1].max()) if len(abs_diff) else 0.0,
         'mean_abs_diff_x_right_m': float(abs_diff[:, 0].mean()) if len(abs_diff) else 0.0,
         'mean_abs_diff_y_forward_m': float(abs_diff[:, 1].mean()) if len(abs_diff) else 0.0,
         'first_diff_xy_right_forward_m': diff[0].astype(float).tolist() if len(diff) else [],
+        'mid_diff_xy_right_forward_m': diff[mid_idx].astype(float).tolist() if len(diff) else [],
         'last_diff_xy_right_forward_m': diff[-1].astype(float).tolist() if len(diff) else [],
+        'final_point_error_m': float(point_error[-1]) if len(point_error) else 0.0,
+        'mean_point_error_m': float(point_error.mean()) if len(point_error) else 0.0,
+        'max_point_error_m': float(point_error.max()) if len(point_error) else 0.0,
     }
 
 
@@ -746,10 +981,35 @@ def main():
                     help='New lidar origin y in original lidar frame; B2D lidar y is forward.')
     ap.add_argument('--dtheta', type=float, default=0.0,
                     help='Yaw of new lidar frame relative to original lidar frame, radians.')
+    ap.add_argument(
+        '--perturb-channels',
+        default='full',
+        choices=PERTURB_CHANNEL_CHOICES,
+        help='Planner-state ablation channel to perturb. '
+             'none keeps planner-state unchanged; full preserves the original all-field behavior.'
+    )
+    ap.add_argument(
+        '--cmd-source',
+        default='route_command',
+        choices=['route_command', 'recovery_ref'],
+        help='Source used when the ego_fut_cmd perturb channel is patched.'
+    )
+    ap.add_argument(
+        '--recovery-near-idx',
+        type=int,
+        default=1,
+        help='Future trajectory index used as near recovery reference.'
+    )
+    ap.add_argument(
+        '--recovery-far-idx',
+        type=int,
+        default=-1,
+        help='Future trajectory index used as far recovery reference.'
+    )
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--camera', default='CAM_FRONT')
-    ap.add_argument('--score-mode', default='argmax')
+    ap.add_argument('--score-mode', default='mode0')
     ap.add_argument(
         '--traj-z',
         type=float,
@@ -785,9 +1045,27 @@ def main():
     inp = sanitize_float32(inp)
     inp_raw_for_vis = copy.deepcopy(inp)
 
-    inp_pert = perturb_input_dict_se2_oracle(dataset, inp, args.idx, args.dx, args.dy, args.dtheta)
+    inp_pert, ablation_info = apply_perturbation_by_channels(
+        dataset,
+        inp,
+        args.idx,
+        args.dx,
+        args.dy,
+        args.dtheta,
+        args.perturb_channels,
+        cmd_source=args.cmd_source,
+        recovery_near_idx=args.recovery_near_idx,
+        recovery_far_idx=args.recovery_far_idx,
+    )
     inp_pert = sanitize_float32(inp_pert)
     inp_pert_raw_for_vis = copy.deepcopy(inp_pert)
+    run_tag = (
+        f"{args.perturb_channels}_idx{args.idx}"
+        f"_cmd{args.cmd_source}"
+        f"_dx{fmt_num_for_filename(args.dx)}"
+        f"_dy{fmt_num_for_filename(args.dy)}"
+        f"_dtheta{fmt_num_for_filename(args.dtheta)}"
+    )
     
     ex = build_example_from_input_dict(dataset, inp)
     ex_pert = build_example_from_input_dict(dataset, inp_pert)
@@ -796,8 +1074,8 @@ def main():
         out = run_model_forward(model, ex, args.device)
         out_pert = run_model_forward(model, ex_pert, args.device)
 
-    json.dump(to_key_tree(out), open(osp.join(args.out_dir, 'outputs_key_tree_original.json'), 'w'), indent=2)
-    json.dump(to_key_tree(out_pert), open(osp.join(args.out_dir, 'outputs_key_tree_perturbed.json'), 'w'), indent=2)
+    json.dump(to_key_tree(out), open(osp.join(args.out_dir, f'outputs_key_tree_original_{run_tag}.json'), 'w'), indent=2)
+    json.dump(to_key_tree(out_pert), open(osp.join(args.out_dir, f'outputs_key_tree_perturbed_{run_tag}.json'), 'w'), indent=2)
 
     pred, dbg = extract_ego_pred_traj(out, score_mode=args.score_mode)
     pred_p, dbg_p = extract_ego_pred_traj(out_pert, score_mode=args.score_mode)
@@ -806,31 +1084,43 @@ def main():
 
     gt = as_traj_np(inp_raw_for_vis['ego_fut_trajs_fix_time'], "gt_orig")
     gt_p = as_traj_np(inp_pert_raw_for_vis['ego_fut_trajs_fix_time'], "gt_pert")
-    save_csv(osp.join(args.out_dir, 'traj_original_pred.csv'), pred)
-    save_csv(osp.join(args.out_dir, 'traj_perturbed_pred.csv'), pred_p)
-    save_csv(osp.join(args.out_dir, 'traj_original_gt.csv'), gt)
-    save_csv(osp.join(args.out_dir, 'traj_perturbed_gt.csv'), gt_p)
+    save_csv(osp.join(args.out_dir, f'traj_original_pred_{run_tag}.csv'), pred)
+    save_csv(osp.join(args.out_dir, f'traj_perturbed_pred_{run_tag}.csv'), pred_p)
+    save_csv(osp.join(args.out_dir, f'traj_original_gt_{run_tag}.csv'), gt)
+    save_csv(osp.join(args.out_dir, f'traj_perturbed_gt_{run_tag}.csv'), gt_p)
 
     # Same delta convention as update_pose_fields:
     #   lidar2world_new = lidar2world_old @ old_lidar_from_new_lidar
     # Therefore a point in the perturbed/new lidar frame maps to the original
     # lidar frame as p_old = old_lidar_from_new_lidar @ p_new.
     delta_lidar = make_se2_delta(args.dx, args.dy, args.dtheta)
+    pred_dst_from_src = delta_lidar if ablation_info['pose_frame_patched'] else np.eye(4, dtype=np.float64)
+    gt_dst_from_src = delta_lidar if ablation_info['future_label_patched'] else np.eye(4, dtype=np.float64)
+    pred_frame_conversion = (
+        'p_old = delta_lidar @ p_new because pose_frame was patched'
+        if ablation_info['pose_frame_patched']
+        else 'identity; pose_frame was not patched, so prediction is already treated as original lidar frame'
+    )
+    gt_frame_conversion = (
+        'p_old = delta_lidar @ p_new because future_label was patched'
+        if ablation_info['future_label_patched']
+        else 'identity; future_label was not patched'
+    )
 
     pred_p_old = transform_traj_lidar_frame(
         pred_p,
-        delta_lidar,
+        pred_dst_from_src,
         order=args.traj_order,
         lateral_positive=args.lateral_positive,
     )
     gt_p_old = transform_traj_lidar_frame(
         gt_p,
-        delta_lidar,
+        gt_dst_from_src,
         order=args.traj_order,
         lateral_positive=args.lateral_positive,
     )
-    save_csv(osp.join(args.out_dir, 'traj_perturbed_pred_in_original_lidar.csv'), pred_p_old)
-    save_csv(osp.join(args.out_dir, 'traj_perturbed_gt_in_original_lidar.csv'), gt_p_old)
+    save_csv(osp.join(args.out_dir, f'traj_perturbed_pred_in_original_lidar_{run_tag}.csv'), pred_p_old)
+    save_csv(osp.join(args.out_dir, f'traj_perturbed_gt_in_original_lidar_{run_tag}.csv'), gt_p_old)
 
     raw_info_for_audit = dataset.get_data_by_index(args.idx)
     lidar2ego = np.asarray(raw_info_for_audit['sensors']['LIDAR_TOP']['lidar2ego'], dtype=np.float64)
@@ -857,6 +1147,9 @@ def main():
     traj_sanity = {
         'frame': 'original_lidar',
         'axis_convention': 'x=vehicle_right, y=forward',
+        'ablation': ablation_info,
+        'pred_frame_conversion': pred_frame_conversion,
+        'gt_frame_conversion': gt_frame_conversion,
         'label_origin_debug': label_origin_debug,
         'gt_p_old_minus_gt_orig': traj_pair_diff_stats(
             gt,
@@ -871,7 +1164,35 @@ def main():
             lateral_positive=args.lateral_positive,
         ),
     }
-    debug_json_path = osp.join(args.out_dir, 'trajectory_frame_sanity.json')
+    metrics = {
+        'idx': args.idx,
+        'dx': args.dx,
+        'dy': args.dy,
+        'dtheta': args.dtheta,
+        'perturb_channels': args.perturb_channels,
+        'cmd_source': args.cmd_source,
+        'recovery_near_idx': args.recovery_near_idx,
+        'recovery_far_idx': args.recovery_far_idx,
+        'recovery_ref_debug': ablation_info.get('recovery_ref_debug', {}),
+        'frame': 'original_lidar',
+        'axis_convention': 'x=vehicle_right, y=forward',
+        'pred_frame_conversion': pred_frame_conversion,
+        'pred_p_old_minus_pred_orig': traj_sanity['pred_p_old_minus_pred_orig'],
+    }
+    metrics_path = osp.join(
+        args.out_dir,
+        f'ablation_metrics_{args.perturb_channels}'
+        f'_cmd{args.cmd_source}'
+        f'_dx{fmt_num_for_filename(args.dx)}'
+        f'_dy{fmt_num_for_filename(args.dy)}'
+        f'_dtheta{fmt_num_for_filename(args.dtheta)}'
+        f'_idx{args.idx}.json',
+    )
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[ablation] saved metrics: {metrics_path}")
+
+    debug_json_path = osp.join(args.out_dir, f'trajectory_frame_sanity_{run_tag}.json')
     with open(debug_json_path, 'w') as f:
         json.dump(traj_sanity, f, indent=2)
     print(f"[sanity] saved trajectory frame sanity: {debug_json_path}")
@@ -937,12 +1258,16 @@ def main():
     ax.set_xlim(-10, 10)
     ax.set_ylim(-5, 35)
     ax.set_title(
-        f'Unified BEV in original lidar frame | idx={args.idx}, dx={args.dx}, dy={args.dy}, dtheta={args.dtheta}\n'
-        f'perturbed trajectories are mapped back before plotting; image/lidar2img unchanged',
+        f'Unified BEV in original lidar frame | ch={args.perturb_channels}, idx={args.idx}, '
+        f'dx={args.dx}, dy={args.dy}, dtheta={args.dtheta}\n'
+        f'pred conversion: {pred_frame_conversion}; image/lidar2img unchanged',
         fontsize=11,
     )
 
-    bev_jpg_path = osp.join(args.out_dir, 'fig_bev_original_vs_perturbed.jpg')
+    bev_jpg_path = osp.join(
+        args.out_dir,
+        f'bev_compare_{run_tag}.png',
+    )
     fig.savefig(bev_jpg_path, dpi=220)
     plt.close(fig)
     print(f"[save] BEV visualization: {bev_jpg_path}")
@@ -989,7 +1314,7 @@ def main():
             order=args.traj_order,
             lateral_positive=args.lateral_positive,
         )
-        pts_pert_old = (delta_lidar @ pts_pert_new.T).T
+        pts_pert_old = (pred_dst_from_src @ pts_pert_new.T).T
 
         uv1, m1, d1 = project_xyz1_to_image(pts_orig, lidar2img, img.shape)
         uv2, m2, d2 = project_xyz1_to_image(pts_pert_old, lidar2img, img.shape)
@@ -1009,7 +1334,7 @@ def main():
         )
         cv2.putText(
             img,
-            f'projection: orig=L, pert=delta@Lprime, z={args.traj_z}',
+            f'projection: ch={args.perturb_channels}, z={args.traj_z}',
             (20, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -1035,7 +1360,10 @@ def main():
             2,
         )
 
-        out_img_path = osp.join(args.out_dir, f'fig_camera_original_vs_perturbed_{cam}.png')
+        out_img_path = osp.join(
+            args.out_dir,
+            f'cam_compare_{run_tag}_{cam}.png',
+        )
         cv2.imwrite(out_img_path, img)
         print(f"[save] camera visualization: {out_img_path}")
 
@@ -1047,7 +1375,7 @@ def main():
             'traj_z': float(args.traj_z),
             'traj_order': args.traj_order,
             'lateral_positive': args.lateral_positive,
-            'perturbed_projection_frame_conversion': 'p_old = delta_lidar @ p_new',
+            'perturbed_projection_frame_conversion': pred_frame_conversion,
         }
 
     old_origin_new = (
@@ -1060,11 +1388,18 @@ def main():
         'dx': args.dx,
         'dy': args.dy,
         'dtheta': args.dtheta,
+        'perturb_channels': args.perturb_channels,
+        'cmd_source': args.cmd_source,
+        'recovery_near_idx': args.recovery_near_idx,
+        'recovery_far_idx': args.recovery_far_idx,
+        'recovery_ref_debug': ablation_info.get('recovery_ref_debug', {}),
+        'ablation': ablation_info,
         'experiment_type': 'planner_state_oracle_no_rerender',
         'image_rerendered': False,
         'delta_semantics': 'old_lidar_from_new_lidar; dx/dy are new lidar origin in original lidar axes (x right, y forward)',
-        'updated_fields': ['ego_pose', 'ego_pose_inv', 'world2lidar', 'ego_translation', 'ego_yaw', 'can_bus', 'sensors.LIDAR_TOP.world2lidar', 'ego_fut_cmd', 'ego_fut_trajs_fix_time', 'ego_fut_masks_fix_time', 'fut_valid_flag_fix_time', 'ego_his_trajs'],
-        'unchanged_fields': ['img', 'img_filename', 'cam_intrinsic', 'lidar2img', 'camera extrinsics', 'agent/map labels', 'ego_fut_trajs_fix_dist'],
+        'updated_fields': ablation_info['patched_fields'],
+        'unchanged_field_groups': ablation_info['not_patched_groups'],
+        'always_unchanged_fields': ['img', 'img_filename', 'cam_intrinsic', 'lidar2img', 'camera extrinsics', 'agent/map labels', 'ego_fut_trajs_fix_dist'],
         'label_origin_debug': label_origin_debug,
         'old_ego_origin_in_new_lidar': old_origin_new.tolist(),
         'command_far_local_before': dataset.get_command_xy_in_local(
@@ -1093,7 +1428,7 @@ def main():
             'bev_y_axis': 'forward',
             'bev_note': 'metric BEV right-positive is aligned with lidar x; camera image left/right is perspective-projected pixels, not a BEV coordinate axis',
             'camera_projection_z': args.traj_z,
-            'camera_perturbed_projection': 'perturbed traj converted by p_old = delta_lidar @ p_new before original lidar2img',
+            'camera_perturbed_projection': pred_frame_conversion,
         },
         'trajectory_frame_sanity': traj_sanity,
         'sanity_checks': {
@@ -1113,7 +1448,7 @@ def main():
         },
         'warnings': ['ego_fut_trajs_fix_dist is not recomputed; this is acceptable for inference-only forward unless later loss/eval code consumes that label.'],
     }
-    with open(osp.join(args.out_dir, 'audit.json'), 'w') as f:
+    with open(osp.join(args.out_dir, f'audit_{run_tag}.json'), 'w') as f:
         json.dump(audit, f, indent=2)
 
 

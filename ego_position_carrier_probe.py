@@ -30,7 +30,7 @@ Put this file in the same directory as ego_ref_shift_diag.py and run:
 python ego_position_carrier_probe.py \
   --config /gs/bs/tga-RLA/qdeng/DriveTransformer/adzoo/drivetransformer/configs/drivetransformer/drivetransformer_large.py \
   --ckpt /gs/bs/tga-RLA/qdeng/DriveTransformer/ckpts/drivetransformer_large.pth \
-  --sample-idxs 0:10:1 \
+  --sample-idxs 0:50:1 \
   --device cuda:0 \
   --out-dir /gs/bs/tga-RLA/qdeng/DriveTransformer/pe_diagnosis/ego_position_carrier_probe
 
