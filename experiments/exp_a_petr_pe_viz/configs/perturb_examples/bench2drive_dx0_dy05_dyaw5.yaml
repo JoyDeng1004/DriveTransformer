@@ -1,0 +1,46 @@
+dataset:
+  name: bench2drive
+  data_root: data/bench2drive/
+  info_root: data/infos/
+  ann_file: data/infos/b2d_infos_v1_val_drivetransformer_meta.pkl
+  scene_id: OppositeVehicleTakingPriority_Town04_Route214_Weather6
+  start_frame: 10
+
+image:
+  source_hw: [900, 1600]
+  final_dim: [384, 1056]
+  stride: 32
+  bot_pct_lim: [0.0, 0.0]
+  apply_eval_resize: true
+
+pe:
+  position_range: [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]
+  depth_start: 1.0
+  depth_num: 64
+  lid: true
+  embed_dims: 512
+  checkpoint_path: null
+  allow_untrained_mlp: false
+  device: cpu
+
+sample:
+  mode: mode_anchor
+  frame_offsets: [-2, -1, 0, 1, 2]
+  camera_index: 0
+  static_anchors:
+    - [0.0, 8.0, 0.0]
+    - [-3.0, 12.0, 0.0]
+    - [3.0, 12.0, 0.0]
+    - [-5.0, 18.0, 0.0]
+    - [5.0, 18.0, 0.0]
+  max_dynamic_agents: 8
+
+perturbed: true
+perturb_ego_se2:
+  dx: 0.0
+  dy: 0.5
+  dyaw_deg: 5.0
+
+output:
+  data_dir: experiments/exp_a_petr_pe_viz/outputs/data
+  store_camera_images: true
