@@ -58,7 +58,15 @@ model = dict(
         loss_map_dir=dict(loss_weight=0.0),
         loss_plan_reg_fix_time=dict(loss_weight=3.5),
         loss_plan_reg_fix_dist=dict(loss_weight=10.0),
-        loss_plan_cls=dict(loss_weight=20.0)))
+        loss_plan_cls=dict(loss_weight=20.0)),
+    train_cfg=dict(
+        pts=dict(
+            assigner=dict(
+                cls_cost=dict(weight=0.0),
+                reg_cost=dict(weight=0.0)),
+            map_assigner=dict(
+                cls_cost=dict(weight=0.0),
+                pts_cost=dict(weight=0.0)))))
 
 data = dict(
     samples_per_gpu=2,
