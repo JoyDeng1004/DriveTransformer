@@ -13,6 +13,8 @@ class B2D_DriveTransformer_Perturb_Dataset(B2D_DriveTransformer_Dataset):
     def __init__(self,
                  perturb_enabled=False,
                  perturb_scale_xy=0.4,
+                 perturb_scale_x=None,
+                 perturb_scale_y=None,
                  perturb_scale_yaw=0.1,
                  perturb_prob=0.5,
                  perturb_seed=None,
@@ -20,6 +22,8 @@ class B2D_DriveTransformer_Perturb_Dataset(B2D_DriveTransformer_Dataset):
         super().__init__(*args, **kwargs)
         self.perturb_enabled = perturb_enabled
         self.perturb_scale_xy = float(perturb_scale_xy)
+        self.perturb_scale_x = float(perturb_scale_xy if perturb_scale_x is None else perturb_scale_x)
+        self.perturb_scale_y = float(perturb_scale_xy if perturb_scale_y is None else perturb_scale_y)
         self.perturb_scale_yaw = float(perturb_scale_yaw)
         self.perturb_prob = float(perturb_prob)
         self._rng = (np.random.RandomState(perturb_seed)
@@ -30,8 +34,10 @@ class B2D_DriveTransformer_Perturb_Dataset(B2D_DriveTransformer_Dataset):
             return np.zeros(2, dtype=np.float64), 0.0
         if self._rng.rand() > self.perturb_prob:
             return np.zeros(2, dtype=np.float64), 0.0
-        dxy = self._rng.uniform(-self.perturb_scale_xy,
-                                 self.perturb_scale_xy, size=2).astype(np.float64)
+        dxy = np.array([
+            self._rng.uniform(-self.perturb_scale_x, self.perturb_scale_x),
+            self._rng.uniform(-self.perturb_scale_y, self.perturb_scale_y),
+        ], dtype=np.float64)
         dyaw = float(self._rng.uniform(-self.perturb_scale_yaw,
                                         self.perturb_scale_yaw))
         return dxy, dyaw
@@ -170,6 +176,102 @@ class B2D_DriveTransformer_Perturb_Dataset(B2D_DriveTransformer_Dataset):
         dt = input_dict['ego_his_trajs'].dtype
         input_dict['ego_his_trajs'] = offset_track.astype(dt)
 
+    def _perturb_ego_fut_cmd(self, input_dict):
+        """基于扰动后的 ego pose 重算 route-command embedding。"""
+        info = self.get_data_by_index(input_dict['index'])
+        command = np.zeros(140, dtype=np.float32)
+        ego_xy = np.asarray(input_dict['ego_translation'][0:2], dtype=np.float64)
+        yaw = float(input_dict['ego_yaw'])
+        command[0:6] = self.command2hot(info['command_far'])
+        command[6:70] = self.pos2posemb(
+            self.get_command_xy_in_local(info['command_far_xy'], ego_xy, yaw))
+        command[70:76] = self.command2hot(info['command_near'])
+        command[76:140] = self.pos2posemb(
+            self.get_command_xy_in_local(info['command_near_xy'], ego_xy, yaw))
+        input_dict['ego_fut_cmd'] = command.astype(input_dict['ego_fut_cmd'].dtype)
+
+    def _perturb_ego_future_trajs(self, input_dict):
+        """重算 fixed-time ego future labels 到扰动后的当前 lidar frame。"""
+        idx = input_dict['index']
+        sample_rate = self.sample_interval_ego_fut
+        future_frames = self.future_frames_ego_fix_time
+        adj_idx_list = range(idx + sample_rate, idx + (future_frames + 1) * sample_rate, sample_rate)
+        full_track = np.zeros((future_frames, 2), dtype=np.float64)
+        full_mask = np.zeros(future_frames, dtype=np.float64)
+        w2l_cur = np.asarray(input_dict['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+        cur_frame = self.get_data_by_index(idx)
+
+        for j, adj_idx in enumerate(adj_idx_list):
+            if not self.is_in_same_route(idx, adj_idx):
+                break
+            adj_frame = self.get_data_by_index(adj_idx)
+            if adj_frame['folder'] != cur_frame['folder']:
+                break
+            w2l_adj = np.asarray(adj_frame['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+            adj2cur = w2l_cur @ np.linalg.inv(w2l_adj)
+            full_track[j, 0:2] = adj2cur[0:2, 3]
+            full_mask[j] = 1
+
+        full_track[~full_mask.astype(bool)] = 0
+        input_dict['ego_fut_trajs_fix_time'] = full_track.astype(input_dict['ego_fut_trajs_fix_time'].dtype)
+        input_dict['ego_fut_masks_fix_time'] = full_mask.astype(input_dict['ego_fut_masks_fix_time'].dtype)
+        input_dict['fut_valid_flag_fix_time'] = input_dict['ego_fut_masks_fix_time'][-1]
+
+    def _perturb_ego_future_trajs_fix_dist(self, input_dict):
+        """重算 fixed-distance ego future labels 到扰动后的当前 lidar frame。"""
+        idx = input_dict['index']
+        sample_rate = 1
+        future_frames = self.future_frames_ego_fix_dist
+        full_track = np.zeros((future_frames, 2), dtype=np.float64)
+        full_mask = np.zeros(future_frames, dtype=np.float64)
+        w2l_cur = np.asarray(input_dict['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+        cur_frame = self.get_data_by_index(idx)
+        pre_xy = np.zeros(2, dtype=np.float64)
+        sampled_num = 0
+        pre_dis = 0.0
+
+        while True:
+            idx += sample_rate
+            if idx < 0 or idx >= len(self):
+                break
+            if self.current_route_start_idx is not None and (
+                    idx < self.current_route_start_idx or idx >= self.current_route_end_idx):
+                break
+            adj_frame = self.get_data_by_index(idx)
+            if adj_frame['folder'] != cur_frame['folder']:
+                break
+            w2l_adj = np.asarray(adj_frame['sensors']['LIDAR_TOP']['world2lidar'], dtype=np.float64)
+            adj2cur = w2l_cur @ np.linalg.inv(w2l_adj)
+            cur_xy = adj2cur[0:2, 3]
+            dis = np.linalg.norm(cur_xy - pre_xy)
+            if dis <= 1e-9:
+                pre_xy = cur_xy.copy()
+                continue
+            if (dis + pre_dis) > self.fix_future_dis:
+                num_samples = int((dis + pre_dis) // self.fix_future_dis)
+                for i in range(num_samples):
+                    ratio = (self.fix_future_dis * (i + 1) - pre_dis) / dis
+                    sampled_xy = pre_xy + ratio * (cur_xy - pre_xy)
+                    full_track[sampled_num, 0:2] = sampled_xy
+                    full_mask[sampled_num] = 1
+                    sampled_num += 1
+                    if sampled_num >= future_frames:
+                        break
+                pre_dis = dis + pre_dis - self.fix_future_dis * num_samples
+                if sampled_num >= future_frames:
+                    break
+            else:
+                pre_dis += dis
+            pre_xy = cur_xy.copy()
+
+        xs = full_track[:, 0].copy()
+        if self.use_angle_as_dis_traj:
+            xs = xs / (np.linalg.norm(full_track, axis=-1) + 1e-9)
+        xs[~full_mask.astype(bool)] = 0
+        input_dict['ego_fut_trajs_fix_dist'] = xs[:, None].astype(input_dict['ego_fut_trajs_fix_dist'].dtype)
+        input_dict['ego_fut_masks_fix_dist'] = full_mask.astype(input_dict['ego_fut_masks_fix_dist'].dtype)
+        input_dict['fut_valid_flag_fix_dist'] = input_dict['ego_fut_masks_fix_dist'][-1]
+
     def _apply_perturbation(self, input_dict, dxy, dyaw):
         if np.allclose(dxy, 0.0) and abs(dyaw) < 1e-12:
             return input_dict
@@ -177,8 +279,11 @@ class B2D_DriveTransformer_Perturb_Dataset(B2D_DriveTransformer_Dataset):
         self._perturb_world_to_lidar_chain(input_dict, dxy, dyaw)
         self._perturb_can_bus(input_dict)
         self._perturb_gt_boxes_and_ann(input_dict)
-        self._perturb_ego_his_trajs(input_dict)  
-        raise NotImplementedError("TODO 8-10 未实现")
+        self._perturb_ego_fut_cmd(input_dict)
+        self._perturb_ego_his_trajs(input_dict)
+        self._perturb_ego_future_trajs(input_dict)
+        self._perturb_ego_future_trajs_fix_dist(input_dict)
+        return input_dict
     
     def prepare_train_data(self, index, aug_config):
         input_dict = self.get_data_info(index)
