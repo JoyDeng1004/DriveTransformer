@@ -17,6 +17,49 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 from mmcv.core.evaluation.eval_hooks import CustomDistEvalHook
 from mmcv.core import EvalHook
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner, Fp16OptimizerHook, OptimizerHook, build_runner)
+
+
+
+def _matches_any_prefix(name, prefixes):
+    return any(name == prefix or name.startswith(prefix + '.') for prefix in prefixes)
+
+
+def apply_recovery_freeze_config(model, freeze_cfg, logger=None):
+    """Apply config-driven parameter freezing before optimizer construction.
+
+    freeze_cfg supports:
+      - trainable_param_prefixes: if set, freeze all params first, then unfreeze
+        only matching prefixes.
+      - frozen_param_prefixes: additionally freeze matching prefixes.
+    """
+    if not freeze_cfg:
+        return
+    trainable = tuple(freeze_cfg.get('trainable_param_prefixes', []) or [])
+    frozen = tuple(freeze_cfg.get('frozen_param_prefixes', []) or [])
+
+    if trainable:
+        for _, param in model.named_parameters():
+            param.requires_grad = False
+        for name, param in model.named_parameters():
+            if _matches_any_prefix(name, trainable):
+                param.requires_grad = True
+
+    if frozen:
+        for name, param in model.named_parameters():
+            if _matches_any_prefix(name, frozen):
+                param.requires_grad = False
+
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_count = sum(p.numel() for p in model.parameters())
+    message = (
+        'Recovery freeze config applied: '
+        f'{trainable_count / 1e6:.3f}M / {total_count / 1e6:.3f}M parameters trainable. '
+        f'trainable_prefixes={list(trainable)}, frozen_prefixes={list(frozen)}'
+    )
+    if logger is not None:
+        logger.info(message)
+    else:
+        print(message)
 from datetime import datetime, timedelta
 import cv2
 cv2.setNumThreads(1)
@@ -289,6 +332,7 @@ def main():
     # Model
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
     model.init_weights()
+    apply_recovery_freeze_config(model, cfg.get('recovery_freeze', None), logger=logger)
     print('Total Number of Learnable Parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad)/1000/1000, "M")
     if args.fuse_conv_bn:
         model.img_backbone = fuse_conv_bn(model.img_backbone)
